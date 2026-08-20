@@ -89,9 +89,10 @@ pub struct EstimateArgs {
 
     /// Assumed search rate in addresses per second.
     ///
-    /// Defaults to the rate measured on an RTX PRO 6000 Blackwell; see
+    /// Defaults to the rate measured on an RTX PRO 6000 Blackwell over 300 runs;
+    /// see
     /// docs/07-benchmarks.md. Pass your own to estimate for a different card.
-    #[arg(long, default_value_t = 1.036e10)]
+    #[arg(long, default_value_t = 1.2514e10)]
     rate: f64,
 }
 
