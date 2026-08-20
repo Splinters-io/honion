@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+# Generated key material must never be committed. Results default to ./keys.
+/keys/
+*.onion/
+hs_ed25519_secret_key
+hs_ed25519_public_key

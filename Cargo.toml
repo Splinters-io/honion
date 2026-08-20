@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/honion-core",
+    "crates/honion-gpu",
+    "crates/honion-keyfile",
+    "crates/honion-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/carroll/honion"
+
+[workspace.dependencies]
+honion-core = { path = "crates/honion-core" }
+honion-gpu = { path = "crates/honion-gpu" }
+honion-keyfile = { path = "crates/honion-keyfile" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["hazmat", "rand_core"] }
+getrandom = "0.3"
+rayon = "1"
+sha3 = "0.10"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

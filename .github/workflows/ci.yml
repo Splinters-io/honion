@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # The CPU crates carry the whole correctness surface: base32, address
+      # construction, and the pattern language, including the property test that
+      # ties the compiled bit-masking predicate to actual address text.
+      - name: test (CPU crates)
+        run: cargo test --release -p honion-core -p honion-keyfile
+
+      # The GPU crates build anywhere; their tests detect the absence of a CUDA
+      # device and skip with a message rather than failing.
+      - name: build (all)
+        run: cargo build --release --workspace
+
+      - name: clippy
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+
+      - name: generated files are up to date
+        run: |
+          python3 cuda/gen_fe32.py > /tmp/fe32.cuh
+          diff -u cuda/fe25519_u32.cuh /tmp/fe32.cuh
+          python3 cuda/verify_dual_law.py

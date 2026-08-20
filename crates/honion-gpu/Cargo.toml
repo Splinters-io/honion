@@ -1,0 +1,22 @@
+[package]
+name = "honion-gpu"
+description = "CUDA search kernel and its host driver, plus the differential tests that gate it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+honion-core.workspace = true
+cudarc = { version = "0.19", default-features = false, features = ["cuda-13010", "driver", "nvrtc", "dynamic-loading"] }
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+curve25519-dalek.workspace = true
+rand = "0.9"
+
+[lints.rust]
+missing_docs = "warn"

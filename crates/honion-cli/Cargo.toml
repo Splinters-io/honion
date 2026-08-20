@@ -1,0 +1,23 @@
+[package]
+name = "honion-cli"
+description = "Command-line interface for the honion vanity .onion generator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "honion"
+path = "src/main.rs"
+
+[dependencies]
+honion-core.workspace = true
+honion-gpu.workspace = true
+honion-keyfile.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
