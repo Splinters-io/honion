@@ -192,9 +192,10 @@ unpredictably with `BATCH_SIZE`:
 | 128 | 11 ms | 876 KB | 4.35 G/s |
 
 The compact version was 4× faster, and the cliff at 64 made the build unusable.
-Pinning unrolling off gives 876 KB and ~2.9 s at every batch size, and made
-throughput monotonic in `BATCH_SIZE` as it should be. The 4.9 G/s figure exists
-because of this one-line change.
+Pinning unrolling off gives predictable code size and compile time at every
+setting, and made throughput monotonic in the batch size as the arithmetic says
+it should be. This was the first real speedup the project got, and it was one
+line — worth remembering before reaching for a rewrite.
 
 ## What was not done
 
