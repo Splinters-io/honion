@@ -138,6 +138,26 @@ generates complete keypairs locally, which means you would learn every
 customer's private key, permanently. The fix — additive split-key generation —
 costs nothing and is described there, but is not implemented.
 
+## Checking it yourself
+
+```bash
+cargo test --release --workspace     # 105 tests; GPU ones skip without a device
+cargo clippy --release --workspace --all-targets
+
+python3 cuda/gen_fe32.py | diff - cuda/fe25519_u32.cuh   # generated field
+                                                         # arithmetic still
+                                                         # matches its generator
+python3 cuda/verify_dual_law.py      # the addition law, against the standard one
+```
+
+The field arithmetic is generated rather than hand-written, because it is 144
+lines whose only content is operand indices — the first diff above is what
+catches a stale header. The two functions in that file that *were* hand-written
+both shipped with a transposed-index bug, caught on the first run by the
+differential test.
+
+To reproduce the benchmark, see [`bench/`](bench/).
+
 ## Documentation
 
 | | |
