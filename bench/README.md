@@ -31,3 +31,26 @@ throughput = hits * 2^D / T
 
 Difficulty differs per tool only so that each produces enough hits for a tight
 estimate; the formula normalises it out.
+
+## Pitfalls
+
+Both of these produced wrong numbers here before they were understood.
+
+**Rebuild the whole workspace before measuring.** `cargo build -p honion-gpu`
+builds the library only and leaves `target/release/honion` stale. Measuring the
+CLI after changing the kernel that way times the *previous* build — which once
+looked exactly like a 25% regression and took a while to attribute.
+
+```
+cargo build --release --workspace     # not -p honion-gpu
+```
+
+**Do not touch the machine while a study runs.** A compile started during one
+tool's phase raised CPU draw from 87 W to 106 W and pulled one run 7% low. That
+is why rounds are interleaved rather than grouped: grouping puts any such drift
+entirely onto whichever tool happens to be running.
+
+**Single runs are noisy.** At a 30-bit prefix a 90-second run finds around a
+thousand keys, so Poisson alone is about ±3%. A single run once read 3.7σ above
+the distribution of ten later runs and was briefly believed. Take medians, and
+interleave anything being compared.
