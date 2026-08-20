@@ -2,56 +2,78 @@
 
 ## Results
 
-Ten runs per tool, 90 seconds each, on one RTX PRO 6000 Blackwell and one
-Threadripper 9960X. Throughput is inferred from keys actually written, not from
-any tool's own counter.
+One hundred rounds, interleaved, 90 seconds per tool per round — 300 runs, about
+seven and a half hours, on an otherwise idle machine.
 
-| tool | device | mean addr/s | sd | 95% CI | vs mkp224o |
-|---|---|---:|---:|---:|---:|
-| **prefix32** | GPU | **1.053 × 10¹⁰** | 2.7 × 10⁸ | ±1.7 × 10⁸ | **41.1×** |
-| **honion** | GPU | **6.932 × 10⁹** | 2.4 × 10⁸ | ±1.5 × 10⁸ | **27.1×** |
-| **mkp224o** | CPU, 48 threads | **2.560 × 10⁸** | 1.2 × 10⁷ | ±7.5 × 10⁶ | 1.0× |
+| tool | device | mean addr/s | sd | 95% CI | min | max | vs mkp224o |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **honion** | GPU | **1.2514 × 10¹⁰** | 4.12 × 10⁸ | ±0.64% | 1.149 × 10¹⁰ | 1.345 × 10¹⁰ | **48.5×** |
+| prefix32 | GPU | 1.0492 × 10¹⁰ | 3.41 × 10⁸ | ±0.64% | 9.664 × 10⁹ | 1.125 × 10¹⁰ | 40.6× |
+| mkp224o | CPU, 48 threads | 2.5812 × 10⁸ | 9.76 × 10⁶ | ±0.74% | 2.345 × 10⁸ | 2.807 × 10⁸ | 1.0× |
 
-Run-to-run spread is under 4% for every tool, so the ordering is not in doubt.
+**honion is 1.193× prefix32** and 48.5× mkp224o. With intervals of ±0.64% against
+a 19.3% margin, the ordering is not in question — a hundred rounds is far more
+than the result needed, and was run to remove any doubt rather than to resolve
+any.
 
-- honion is **27× faster than mkp224o**, the established CPU generator, with
-  mkp224o given its fastest backend on this machine.
-- honion is **0.66× prefix32** — prefix32 is about 1.5× ahead.
+Run-to-run spread is 3.3% for honion, 3.3% for prefix32 and 3.8% for mkp224o.
+
+### Why interleaved
+
+Rounds cycle mkp224o → honion → prefix32 rather than running each tool's hundred
+in a block. Grouped phases mean any drift in machine conditions lands entirely
+on whichever tool happens to be running. That is not hypothetical: an earlier
+grouped run of this benchmark was contaminated when a compile was started during
+prefix32's phase, visible as CPU draw rising from 87 W to 106 W and one run
+coming in 7% low. Interleaving spreads such drift across all three.
 
 ### Energy
 
-Sampled every two seconds; "over idle" subtracts a 30-second baseline of
-25.2 W GPU / 62.1 W CPU.
+Sampled every two seconds, with a 30-second idle baseline of 24.9 W GPU /
+58.3 W CPU subtracted.
 
-| tool | GPU W | CPU W | W over idle | addr/s per watt |
-|---|---:|---:|---:|---:|
-| prefix32 | 590.8 | 87.5 | 591.0 | 1.78 × 10⁷ |
-| honion | 572.6 | 92.1 | 577.3 | 1.20 × 10⁷ |
-| mkp224o | 24.9 | 336.9 | 274.5 | 9.33 × 10⁵ |
+| tool | GPU W | CPU W | W over idle | addr/s per watt | vs mkp224o |
+|---|---:|---:|---:|---:|---:|
+| **honion** | 589.4 | 111.2 | 617.4 | **2.027 × 10⁷** | **30.6×** |
+| prefix32 | 590.9 | 87.6 | 595.3 | 1.763 × 10⁷ | 26.6× |
+| mkp224o | 133.9 | 338.6 | 389.3 | 6.630 × 10⁵ | 1.0× |
 
-Both GPU tools draw roughly the same power, so the efficiency ordering matches
-the throughput ordering. Against the CPU the gap is wider than raw throughput
-suggests: honion is 27× faster but **13× more energy-efficient per address**,
-because it draws about twice the power to do it.
+honion is both the fastest and the most efficient per address, despite drawing
+the most power. Its higher CPU draw than prefix32 is the host-side key
+derivation, which it does for every thread every launch and prefix32 does not.
 
-### What this means in practice
+One artifact worth naming: mkp224o's GPU figure of 133.9 W is not work it is
+doing. Interleaving means it runs immediately after a GPU tool, and the card has
+not finished clocking down while it is being sampled. That inflates mkp224o's
+"over idle" and therefore *understates* its efficiency. The effect is confined
+to this table.
+
+### What it means in practice
 
 Expected time to find a prefix, at each tool's measured mean rate:
 
-| characters | prefix32 | honion | mkp224o |
+| characters | honion | prefix32 | mkp224o |
 |---|---|---|---|
-| 7 | 3.3 s | 5.0 s | 2.2 min |
-| 8 | 1.7 min | 2.6 min | 1.2 hours |
-| 9 | 56 min | 1.4 hours | 1.6 days |
-| 10 | 1.2 days | 1.9 days | 51 days |
-| 11 | 40 days | 60 days | 4.5 years |
-| 12 | 3.5 years | 5.3 years | 143 years |
+| 7 | 2.7 s | 3.3 s | 2.2 min |
+| 8 | 1.5 min | 1.7 min | 1.2 hours |
+| 9 | 47 min | 56 min | 1.6 days |
+| 10 | **25 hours** | 30 hours | 51 days |
+| 11 | 33 days | 40 days | 4.4 years |
+| 12 | 2.9 years | 3.5 years | 142 years |
 
-Ten characters is a weekend on either GPU and two months on the CPU. Eleven is
-out of reach for all three on one machine.
+Ten characters is a day on the fastest GPU tool and seven weeks on the CPU.
+Eleven is out of reach for all three on one machine.
 
-Remember these are means of a memoryless process, not deadlines: there is a 63%
-chance of a result by the expected time and 95% by three times it.
+These are means of a memoryless process, not deadlines: there is a 63% chance of
+a result by the expected time, 86% by twice it, and 95% by three times.
+
+### Scope of the claim
+
+This is one operating point: a 30-bit prefix, on one card, with each tool at its
+own tuned settings. It is not a claim about other GPUs, other prefix lengths, or
+multi-pattern searches. honion's default configuration uses 17.2 GB of device
+memory, which a smaller card cannot provide — the thread count scales down
+automatically, but the ranking on such a card has not been measured.
 
 ### End-to-end versus kernel throughput
 
@@ -124,7 +146,7 @@ Difficulty differs per tool (25 bits for mkp224o, 30 for the GPU tools) purely
 so that each produces enough hits for a tight estimate. The formula normalises
 difficulty out, so this does not bias the comparison.
 
-Ten runs of 90 seconds each per tool, run sequentially with no overlap, on an
+One hundred interleaved rounds of 90 seconds per tool, run sequentially with no overlap, on an
 otherwise idle machine. Output went to `/dev/shm` so that filesystem writes
 could not become the bottleneck. Power was sampled every 2 seconds from
 `nvidia-smi` and the CPU package RAPL counter, with a 30-second idle baseline
@@ -156,8 +178,8 @@ The harness and the raw per-run data are in [`../bench/`](../bench/):
 
 ```bash
 cd bench
-./study.sh                              # 10 runs x 90s per tool
-./analyse.py results-2026-08-19.csv     # the tables above, regenerated
+T=90 REPS=100 ./study.sh                  # 100 interleaved rounds
+./analyse.py results-2026-08-20-n100.csv   # the tables above, regenerated
 ```
 
 ## What the first benchmark found, and what was done about it
@@ -274,13 +296,15 @@ trade is worth making depends on what the keys are for.
 
 ## Summary
 
-- honion: 1.036 × 10^10 addr/s, 40.5× mkp224o
-- prefix32: 1.053 × 10^10 addr/s, 41.1× mkp224o
-- mkp224o: 2.560 × 10^8 addr/s
+- honion: 1.2514 × 10¹⁰ addr/s — 48.5× mkp224o, 1.193× prefix32
+- prefix32: 1.0492 × 10¹⁰ addr/s — 40.6× mkp224o
+- mkp224o: 2.5812 × 10⁸ addr/s
 
-The two GPU implementations are within about 2% of each other, which is close to
-the run-to-run spread of the measurement itself. Both are roughly forty times a
-48-thread CPU build of mkp224o on this hardware.
+Raw per-run data for all 300 runs, and the harness that produced it, are in
+[`../bench/`](../bench/).
 
-Raw data for every run is in [`../bench/`](../bench/), along with the harness
-that produced it.
+The path from 0.66× prefix32 to 1.193× is documented in
+[02-gpu-architecture.md](02-gpu-architecture.md): four changes, each addressing a
+different bottleneck — work per candidate, 64-bit emulation, memory bandwidth,
+and dependency-chain length — plus five attempts that were measured and
+discarded.

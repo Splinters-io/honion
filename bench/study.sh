@@ -73,10 +73,11 @@ sleep 1 & sample_power $! >/dev/null
 (sleep 30) & IDLE=$(sample_power $!); echo "idle: gpu=$(echo $IDLE|cut -d' ' -f1)W cpu=$(echo $IDLE|cut -d' ' -f2)W"
 echo "idle,0,-,0,0,30,0,$(echo $IDLE|cut -d' ' -f1),$(echo $IDLE|cut -d' ' -f2)" >> $CSV
 
-echo "### mkp224o, 48 threads, amd64-64-24k, $REPS x ${T}s"
-for r in $(seq 1 $REPS); do run_one mkp224o hon2o 25 $r; done
-echo "### honion, batch 256 / 131072 threads, $REPS x ${T}s"
-for r in $(seq 1 $REPS); do run_one honion hon2on 30 $r; done
-echo "### prefix32 (OpenCL), GPU, $REPS x ${T}s"
-for r in $(seq 1 $REPS); do run_one prefix32 hon2on 30 $r; done
+echo "### interleaved: $REPS rounds of (mkp224o, honion, prefix32) x ${T}s each"
+for r in $(seq 1 $REPS); do
+  echo "--- round $r/$REPS ---"
+  run_one mkp224o  hon2o  25 $r
+  run_one honion   hon2on 30 $r
+  run_one prefix32 hon2on 30 $r
+done
 echo "### DONE"
