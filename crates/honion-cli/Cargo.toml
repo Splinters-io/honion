@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "honion"
@@ -12,12 +13,22 @@ path = "src/main.rs"
 
 [dependencies]
 honion-core.workspace = true
-honion-gpu.workspace = true
 honion-keyfile.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+
+# The device backend is a property of the platform, so it is chosen here — the
+# one place that knows it is building a shippable binary — rather than by every
+# consumer of honion-gpu. macOS gets Metal; everything else gets CUDA. Source
+# code stays backend-agnostic: it names honion_gpu::Searcher and never a
+# backend (DEC-BACKEND-002).
+[target.'cfg(target_os = "macos")'.dependencies]
+honion-gpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+honion-gpu = { workspace = true, features = ["cuda"] }
 
 [lints.rust]
 missing_docs = "warn"

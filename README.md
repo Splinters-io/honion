@@ -29,15 +29,27 @@ address unmodified.
 
 ## Requirements
 
-- An NVIDIA GPU, compute capability 5.0 or later
-- The NVIDIA driver and `libnvrtc` — **no CUDA toolkit needed**; device code is
-  compiled at run time
-- Rust 1.85 or later
+A GPU on one of two backends, chosen at build time by a Cargo feature and
+selected automatically per platform:
+
+- **NVIDIA** (`--features cuda`, the default on non-macOS): a GPU of compute
+  capability 5.0 or later, plus the NVIDIA driver and `libnvrtc` — **no CUDA
+  toolkit needed**; device code is compiled at run time.
+- **Apple Silicon** (`--features metal`, the default on macOS): an M-series Mac
+  running macOS. No toolchain beyond Xcode's command-line tools; MSL is compiled
+  at run time. See [docs/08-metal-backend.md](docs/08-metal-backend.md).
+
+Rust 1.85 or later either way.
 
 ```
-cargo build --release
+cargo build --release          # picks the backend for your platform
 ./target/release/honion --help
 ```
+
+The headline throughput figures below are for the NVIDIA backend. Apple Silicon
+is about two orders of magnitude slower — a measured ~0.09 G/s on an M4 Max, see
+[docs/08](docs/08-metal-backend.md) — because it has tens of GPU cores to a
+datacentre card's tens of thousands, not because of a worse method.
 
 ## Use
 
@@ -170,15 +182,17 @@ To reproduce the benchmark, see [`bench/`](bench/).
 | [05 — Security model](docs/05-security-model.md) | threat model, key handling, and the service problem |
 | [06 — Performance](docs/06-performance.md) | measurements, tuning, and what was left undone |
 | [07 — Benchmarks](docs/07-benchmarks.md) | measured against `mkp224o` and `prefix32`, method included |
+| [08 — Metal backend](docs/08-metal-backend.md) | honion on Apple Silicon: the MSL port, the compiler traps, and the measured numbers |
 
 ## Layout
 
 ```
 bench/    benchmark harness and raw per-run data
-cuda/     device code: field arithmetic, curve arithmetic, the search kernel
+cuda/     NVIDIA device code: field arithmetic, curve arithmetic, the search kernel
 crates/
   honion-core     base32, addresses, the pattern language   (no GPU, no secrets)
-  honion-gpu      the kernel and its host driver            (no secrets)
+  honion-gpu      the kernels and their host drivers         (no secrets)
+                  metal/ holds the Apple Silicon device code
   honion-keyfile  secret scalars, verification, Tor files   (no GPU)
   honion-cli      the honion binary
 ```

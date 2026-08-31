@@ -1,0 +1,84 @@
+# CI: build and test both device backends, one per platform.
+#
+# What actually reaches the runners, and why:
+#
+# `required-features` in honion-gpu's Cargo.toml does NOT keep the device
+# suites out of a workspace test run. honion-cli selects a backend per platform
+# via `[target.'cfg(...)'.dependencies]`, so `cargo test --workspace` turns on
+# `cuda` on Linux and `metal` on macOS through feature unification — the
+# required-features are satisfied and every device test builds and runs. The
+# only thing standing between those tests and a GPU-less runner is the run-time
+# skip in each Harness::new(), so that skip has to actually work.
+#
+# On Linux it now does. cudarc's `dynamic-loading` dlopens libcuda on first use
+# and *panics* when it is missing, so matching on `CudaContext::new`'s Err was
+# never reached; the harnesses ask `search::cuda::driver_present()` first and
+# skip cleanly. The linux-cuda job therefore proves compilation, clippy, and
+# every host-side test, and skips the differential CUDA suites.
+#
+# macOS is different: the runner has a real, working Metal device, so nothing
+# skips and the Metal differential suites genuinely run here. That is coverage
+# worth having, and it is why MslKernel::dispatch checks the command buffer's
+# status — a kernel that faults on the runner has to say so rather than leave
+# an untouched output buffer to be read as a wrong answer.
+#
+# No untrusted event data (titles, bodies, branch names) is interpolated into
+# any run: step, so the workflow-injection class of attack does not apply.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux + the CUDA backend. cudarc's dynamic-loading feature means no CUDA
+  # toolkit is needed to compile — the driver is dlopen'd at run time.
+  linux-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build honion-gpu (cuda)
+        run: cargo build --release -p honion-gpu --features cuda
+      # One test at a time. Cargo runs test binaries one after another, but
+      # within a binary it runs the tests concurrently, and each device test
+      # builds its own harness and so holds its own command queue. That puts
+      # several long compute command buffers in flight on one shared runner GPU
+      # at once, and each one's wall-clock stretches under the contention until
+      # macOS's GPU watchdog kills whichever is unluckiest with
+      # kIOGPUCommandBufferCallbackErrorHang — which is why CI failed in a
+      # different place on almost every run. Serialising costs a little wall
+      # clock and removes the contention rather than shrinking the tests.
+      - name: Test workspace
+        run: cargo test --release --workspace -- --test-threads=1
+      - name: Clippy
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+
+  # macOS on Apple Silicon + the Metal backend. macos-latest runners are
+  # arm64; the workspace build resolves honion-cli's platform-cfg dependency
+  # to the metal feature automatically.
+  macos-metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build honion-gpu (metal)
+        run: cargo build --release -p honion-gpu --features metal
+      # One test at a time. Cargo runs test binaries one after another, but
+      # within a binary it runs the tests concurrently, and each device test
+      # builds its own harness and so holds its own command queue. That puts
+      # several long compute command buffers in flight on one shared runner GPU
+      # at once, and each one's wall-clock stretches under the contention until
+      # macOS's GPU watchdog kills whichever is unluckiest with
+      # kIOGPUCommandBufferCallbackErrorHang — which is why CI failed in a
+      # different place on almost every run. Serialising costs a little wall
+      # clock and removes the contention rather than shrinking the tests.
+      - name: Test workspace
+        run: cargo test --release --workspace -- --test-threads=1
+      - name: Clippy
+        run: cargo clippy --release --workspace --all-targets -- -D warnings

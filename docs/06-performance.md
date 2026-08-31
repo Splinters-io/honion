@@ -1,6 +1,13 @@
 # Performance: measurements and what they mean for you
 
-All figures measured on the machine this was developed on:
+This document is the NVIDIA backend. The Apple Silicon (Metal) backend is
+measured separately in [08-metal-backend.md](08-metal-backend.md); on an M4 Max
+it reaches about 0.09 × 10⁹/s, roughly 130× below the figures here, and the
+`honion estimate` default rate is the CUDA number below, so its time estimates
+are optimistic on Apple Silicon until a Metal rate is wired in (the live
+progress line always reports the true measured rate).
+
+All figures below measured on the machine this was developed on:
 
 - **GPU** NVIDIA RTX PRO 6000 Blackwell Workstation Edition — sm_120 (compute
   capability 12.0), 188 SMs, 24 064 CUDA cores, 96 GB, 3.09 GHz max SM clock

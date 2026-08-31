@@ -17,14 +17,52 @@
 # launch's work is discarded (expected loss ~2s of 90s, about 2%). mkp224o
 # writes each key as it is found and loses nothing.
 set -u
-S=/tmp/claude-1000/-home-carroll-honion/f014c0db-6a57-48fe-b1ba-2bd618bddc06/scratchpad
-MK=$S/mkp224o/mkp224o
-HO=/home/carroll/honion/target/release/honion
-P32=$S/Prefix32/target/release/prefix32
+
+# Every path is overridable from the environment, and the defaults resolve
+# against this checkout rather than the machine the study was first run on.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+
+# mkp224o and Prefix32 are the tools honion is compared against. They are not
+# part of this repository: build them somewhere and point TOOLS at the directory
+# holding both, or set MK and P32 directly.
+TOOLS=${TOOLS:-$ROOT/bench/tools}
+MK=${MK:-$TOOLS/mkp224o/mkp224o}
+P32=${P32:-$TOOLS/Prefix32/target/release/prefix32}
+HO=${HO:-$ROOT/target/release/honion}
+
 T=${T:-90}
 REPS=${REPS:-10}
-CSV=$S/results.csv
-RAPL=/sys/class/powercap/intel-rapl:0
+CSV=${CSV:-$ROOT/bench/results-$(date +%Y-%m-%d).csv}
+RAPL=${RAPL:-/sys/class/powercap/intel-rapl:0}
+
+# Check the binaries before measuring anything, not after. A missing one would
+# otherwise background a "command not found", find zero keys, and be recorded as
+# a measured rate of zero -- a wrong number indistinguishable from a real one in
+# the CSV. This is the same discipline as the rest of the harness: a measurement
+# that cannot be trusted must fail, not be written down.
+missing=0
+for spec in "mkp224o:$MK" "honion:$HO" "prefix32:$P32"; do
+  name=${spec%%:*}
+  path=${spec#*:}
+  if [ ! -x "$path" ]; then
+    echo "study.sh: $name is missing or not executable: $path" >&2
+    missing=1
+  fi
+done
+if [ "$missing" -ne 0 ]; then
+  cat >&2 <<'USAGE'
+
+Point the script at your builds, for example:
+
+  TOOLS=/path/to/comparison-tools \
+  HO=/path/to/honion/target/release/honion \
+    bench/study.sh
+
+TOOLS, MK, P32, HO, CSV, T, REPS and RAPL are all overridable.
+USAGE
+  exit 1
+fi
 
 echo "tool,rep,filter,bits,hits,seconds,addr_per_sec,gpu_watts,cpu_watts" > $CSV
 

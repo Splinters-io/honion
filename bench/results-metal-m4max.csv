@@ -1,0 +1,7 @@
+backend,device,half,threads,cands,rep,seconds,g_addr_per_sec,msl_compile_ms
+metal,apple-m4-max,256,262144,8192,1,26.99,0.080,216
+metal,apple-m4-max,256,262144,8192,2,24.29,0.089,216
+metal,apple-m4-max,512,262144,8192,1,26.17,0.082,492
+metal,apple-m4-max,512,262144,8192,2,23.47,0.092,492
+metal,apple-m4-max,1024,262144,8192,1,22.87,0.094,434
+metal,apple-m4-max,1024,262144,8192,2,22.12,0.097,434

@@ -1,48 +1,54 @@
-//! End-to-end tests for the search kernel.
+//! End-to-end tests for the Metal search kernel.
 //!
-//! The field and group tests establish that the device does correct arithmetic.
-//! These establish the two remaining claims:
+//! The Metal mirror of `tests/search_kernel.rs`. The field and group tests
+//! established correct arithmetic; these establish the two remaining claims:
 //!
-//! * **It walks the keys it says it walks.** Iteration `k` on thread `t` must
-//!   be the public key of `a0[t] + 8k`, because that identity is how the host
-//!   reconstructs a secret from a hit. `walk_matches_scalar_arithmetic` checks
-//!   the entire visited sequence, not just its endpoints.
+//! * **It walks the keys it says it walks.** Iteration `k` on thread `t` must be
+//!   the public key of `a0[t] + 8k` — the identity the host uses to reconstruct
+//!   a secret from a hit.
+//! * **It finds exactly the right keys.** The device's hit set over a search
+//!   space is compared for *equality* against the host reference matcher over
+//!   the same space: no missing hits, no spurious ones.
 //!
-//! * **It finds exactly the right keys — no more, no fewer.** The device's set
-//!   of hits over a search space is compared for equality against the host
-//!   reference matcher run over the same space. A missing hit means wasted GPU
-//!   time; a spurious one means a bug the verifier would have to catch. Neither
-//!   is acceptable, so the test demands exact agreement rather than containment.
+//! `honion_gpu::Searcher` resolves to the Metal backend under the `metal`
+//! feature, so these use the same public API the CUDA tests do.
+
+// @decision DEC-METAL-006 (verified here)
+// @title The Metal search kernel earns the CUDA set-equality bar, traps neutralised
+// @status accepted
+// @rationale This is the first kernel with a batch loop over the cold inversion,
+//   so it is where the second compiler trap (full unrolling of the HALF loop,
+//   guarded by `#pragma clang loop unroll(disable)`) becomes observable. That
+//   the suite compiles the kernel at HALF up to 512 in seconds — rather than
+//   hanging or emitting a huge library — is the verification that the pragma is
+//   honoured. Correctness is the CUDA set-equality bar: exact agreement with an
+//   independent host reference over the full covered space, incl. negative
+//   offsets, residual patterns, multiple patterns, and every table size.
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::Scalar;
-use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use honion_core::address::OnionAddress;
 use honion_core::pattern::{Pattern, PatternSet};
-use honion_gpu::{DeviceTables, Searcher};
+use honion_gpu::{DeviceTables, SearchError, Searcher};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-/// Whether a CUDA device is usable; tests no-op without one.
+/// Whether a Metal device is usable; tests no-op without one. Probed by trying
+/// to build a searcher for a trivial pattern.
 fn have_gpu() -> bool {
-    // Ask before touching cudarc: with no driver library installed it panics
-    // out of a `OnceLock` initialiser rather than returning an error, so the
-    // `Err` arm below never gets the chance to report "no device".
-    if !honion_gpu::search::cuda::driver_present() {
-        eprintln!("skipping: no CUDA driver library present");
-        return false;
-    }
-    match CudaContext::new(0) {
+    let set = PatternSet::compile(&[Pattern::parse("a").expect("valid")]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+    match Searcher::new(&tables, 64, 8, 16) {
         Ok(_) => true,
-        Err(e) => {
-            eprintln!("skipping: no CUDA device available ({e:?})");
+        Err(SearchError::Driver(msg)) if msg.contains("no Metal device") => {
+            eprintln!("skipping: no Metal device available");
             false
         }
+        Err(e) => panic!("unexpected searcher error while probing: {e}"),
     }
 }
 
-/// Random starting scalars and their public points.
 fn starting_points(count: usize, seed: u64) -> (Vec<Scalar>, Vec<[u8; 32]>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let scalars: Vec<Scalar> = (0..count)
@@ -60,12 +66,6 @@ fn starting_points(count: usize, seed: u64) -> (Vec<Scalar>, Vec<[u8; 32]>) {
 }
 
 /// Public keys of `start + 8m` for `m` in `first ..< first + count`.
-///
-/// The kernel covers a contiguous run of offsets *centred* on each thread's
-/// starting scalar, because the dual addition law yields `base + off` and
-/// `base - off` together. A batch spans `[-half, +half]`, and successive
-/// batches step by `2*half + 1`, so the ranges tile exactly: overall coverage
-/// is the contiguous range `[-half, batches*(2*half+1) - half - 1]`.
 fn host_offsets(start: &Scalar, first: i64, count: u32) -> Vec<(i64, [u8; 32])> {
     let eight = Scalar::from(8u64);
     let eight_b = ED25519_BASEPOINT_POINT * eight;
@@ -90,76 +90,8 @@ fn coverage(half: u32, candidates: u32) -> (i64, u32) {
     (-i64::from(half), batches * per_batch)
 }
 
-/// Every key thread `t` visits, for the simple `+8B` walk the dump kernel does.
-fn host_walk(start: &Scalar, iterations: u32) -> Vec<[u8; 32]> {
-    host_offsets(start, 0, iterations)
-        .into_iter()
-        .map(|(_, k)| k)
-        .collect()
-}
-
-#[test]
-fn walk_matches_scalar_arithmetic() {
-    if !have_gpu() {
-        return;
-    }
-    const THREADS: usize = 64;
-    const ITERS: u32 = 128;
-
-    let (scalars, points) = starting_points(THREADS, 21);
-
-    let ctx = CudaContext::new(0).expect("context");
-    let (major, minor) = ctx.compute_capability().expect("capability");
-    let ptx = honion_gpu::nvrtc::compile_cached(
-        honion_gpu::nvrtc::sources::SEARCH,
-        (major as u32, minor as u32),
-        &[],
-    )
-    .expect("compiles");
-    let module = ctx.load_module(ptx.into()).expect("module");
-    let func = module.load_function("honion_walk_dump").expect("kernel");
-
-    let stream = ctx.default_stream();
-    let flat: Vec<u8> = points.iter().flatten().copied().collect();
-    let d_in: CudaSlice<u8> = stream.clone_htod(&flat).expect("upload");
-    let mut d_out: CudaSlice<u8> = stream
-        .alloc_zeros(THREADS * ITERS as usize * 32)
-        .expect("alloc");
-    let n = THREADS as u32;
-    let mut b = stream.launch_builder(&func);
-    b.arg(&d_in).arg(&n).arg(&ITERS).arg(&mut d_out);
-    // Safety: signature and buffer sizes match; the kernel bounds-checks `n`.
-    unsafe {
-        b.launch(LaunchConfig {
-            grid_dim: (n.div_ceil(128), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .expect("launch");
-    stream.synchronize().expect("sync");
-    let out = stream.clone_dtoh(&d_out).expect("download");
-
-    for (t, s) in scalars.iter().enumerate() {
-        let expected = host_walk(s, ITERS);
-        for (k, want) in expected.iter().enumerate() {
-            let base = (t * ITERS as usize + k) * 32;
-            assert_eq!(
-                &out[base..base + 32],
-                &want[..],
-                "thread {t} iteration {k}: device visited a different key than a0 + 8*{k}"
-            );
-        }
-    }
-}
-
 #[test]
 fn finds_a_planted_needle() {
-    // Take a key the search will pass over, use its own address prefix as the
-    // pattern, and require the device to report it at exactly the right place.
-    // This is the whole tool in miniature: if the reported (thread, iteration)
-    // were off by one, the host would reconstruct the wrong secret and the key
-    // it wrote would not match its address.
     if !have_gpu() {
         return;
     }
@@ -167,10 +99,7 @@ fn finds_a_planted_needle() {
     const HALF: u32 = 64;
     const CANDS: u32 = 4000;
     const NEEDLE_THREAD: usize = 137;
-    // Deliberately negative: a match below the starting scalar is exactly what
-    // the old, one-directional enumeration could not produce, and getting its
-    // sign wrong would reconstruct a different key.
-    const NEEDLE_OFFSET: i64 = -37;
+    const NEEDLE_OFFSET: i64 = -37; // negative: below the starting scalar
 
     let (scalars, points) = starting_points(THREADS as usize, 22);
 
@@ -178,8 +107,6 @@ fn finds_a_planted_needle() {
         scalars[NEEDLE_THREAD] - Scalar::from(8u64) * Scalar::from(NEEDLE_OFFSET.unsigned_abs());
     let needle_key = (ED25519_BASEPOINT_POINT * needle_scalar).compress().to_bytes();
 
-    // A ten-character prefix of the needle's own address. Long enough that a
-    // second, coincidental match in 102 400 keys is essentially impossible.
     let address = OnionAddress::from_pubkey(&needle_key);
     let prefix: String = address.body().chars().take(10).collect();
     let pattern = Pattern::parse(&prefix).expect("an address prefix is valid base32");
@@ -199,8 +126,6 @@ fn finds_a_planted_needle() {
     assert_eq!(hit.thread_id as usize, NEEDLE_THREAD, "wrong thread reported");
     assert_eq!(i64::from(hit.offset), NEEDLE_OFFSET, "wrong offset reported");
 
-    // Reconstruct the secret exactly as the real verifier will, and confirm it
-    // reproduces the address we searched for.
     let m = i64::from(hit.offset);
     let recovered = if m >= 0 {
         scalars[hit.thread_id as usize] + Scalar::from(8u64) * Scalar::from(m.unsigned_abs())
@@ -215,8 +140,7 @@ fn finds_a_planted_needle() {
     );
 }
 
-/// Run a search and, independently, the host reference over the same space;
-/// require the two hit sets to be equal.
+/// Run a search and the host reference over the same space; require equality.
 fn assert_device_agrees_with_host(pattern_src: &str, threads: u32, candidates: u32, half: u32) {
     let (scalars, points) = starting_points(threads as usize, 23);
     let pattern = Pattern::parse(pattern_src).expect("valid pattern");
@@ -258,8 +182,8 @@ fn assert_device_agrees_with_host(pattern_src: &str, threads: u32, candidates: u
 
     assert_eq!(
         device, host,
-        "device and host reference disagree for pattern {pattern_src:?} \
-         (half {half}); device found {} hits, host found {}",
+        "device and host reference disagree for pattern {pattern_src:?} (half {half}); \
+         device found {} hits, host found {}",
         device.len(),
         host.len()
     );
@@ -274,12 +198,103 @@ fn device_hits_exactly_match_the_host_reference() {
     if !have_gpu() {
         return;
     }
-    // A two-character prefix: ten bits, so ~128 hits in 131 072 keys — enough
-    // that both a missing and a spurious hit would show.
     assert_device_agrees_with_host("ab", 256, 512, 32);
-    // And a case where coverage is not a whole number of batches, so the
-    // rounding up to a full batch is exercised.
+    // Coverage not a whole number of batches, so the round-up is exercised.
     assert_device_agrees_with_host("ab", 256, 500, 32);
+}
+
+/// Splitting a launch across dispatches must not change what it finds.
+///
+/// A launch is normally chunked to a wall-clock target (DEC-METAL-009), and on
+/// a fast device that means one or two dispatches — so the resume path barely
+/// runs unless it is forced. Here the same search runs twice over identical
+/// starting points: once with the sizing left alone, once capped to one batch
+/// per dispatch, which splits it the maximum number of ways. Every reported hit
+/// must match, offsets included, because an offset is what the host reconstructs
+/// a key from: a resume that lost track of where the walk was would still report
+/// plausible-looking hits, just at the wrong absolute offsets.
+#[test]
+fn splitting_a_launch_across_dispatches_changes_nothing() {
+    if !have_gpu() {
+        return;
+    }
+    const THREADS: u32 = 256;
+    const HALF: u32 = 32;
+    const CANDS: u32 = 512;
+
+    let (_scalars, points) = starting_points(THREADS as usize, 24);
+    let pattern = Pattern::parse("ab").expect("valid pattern");
+    let set = PatternSet::compile(&[pattern]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+
+    let run = |cap: Option<u32>| {
+        let mut s = Searcher::new(&tables, THREADS, HALF, 1 << 16).expect("searcher");
+        s.set_max_batches_per_dispatch(cap);
+        s.set_start_points(&points).expect("points");
+        let outcome = s.launch(CANDS).expect("launch");
+        let mut hits: Vec<(u32, i32, u32)> = outcome
+            .hits
+            .iter()
+            .map(|h| (h.thread_id, h.offset, h.pattern_id))
+            .collect();
+        hits.sort_unstable();
+        (hits, outcome.total_found, outcome.examined)
+    };
+
+    // `CANDS / (2 * HALF + 1)` is 8 batches, so the capped run uses eight
+    // dispatches where the free-running one uses one or two.
+    let (whole, whole_found, whole_examined) = run(None);
+    let (split, split_found, split_examined) = run(Some(1));
+
+    assert!(
+        !whole.is_empty(),
+        "the test space contained no matches, so the comparison is vacuous"
+    );
+    assert_eq!(whole, split, "chunking changed which candidates were reported");
+    assert_eq!(whole_found, split_found, "chunking changed the hit count");
+    assert_eq!(
+        whole_examined, split_examined,
+        "chunking changed how many addresses the launch claims to have examined"
+    );
+}
+
+/// A capped launch must stay correct across repeats, not just on a cold
+/// searcher: the walk buffer is reused, so a launch that left it dirty would
+/// show up as the second launch disagreeing with the first.
+#[test]
+fn a_chunked_searcher_repeats_a_launch_identically() {
+    if !have_gpu() {
+        return;
+    }
+    const THREADS: u32 = 256;
+    const HALF: u32 = 32;
+    const CANDS: u32 = 512;
+
+    let (_scalars, points) = starting_points(THREADS as usize, 25);
+    let pattern = Pattern::parse("ab").expect("valid pattern");
+    let set = PatternSet::compile(&[pattern]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+
+    let mut s = Searcher::new(&tables, THREADS, HALF, 1 << 16).expect("searcher");
+    s.set_max_batches_per_dispatch(Some(1));
+
+    let mut seen = Vec::new();
+    for round in 0..3 {
+        s.set_start_points(&points).expect("points");
+        let outcome = s.launch(CANDS).expect("launch");
+        let mut hits: Vec<(u32, i32, u32)> = outcome
+            .hits
+            .iter()
+            .map(|h| (h.thread_id, h.offset, h.pattern_id))
+            .collect();
+        hits.sort_unstable();
+        if round == 0 {
+            assert!(!hits.is_empty(), "no matches, so the comparison is vacuous");
+            seen = hits;
+        } else {
+            assert_eq!(seen, hits, "round {round} disagreed with the first launch");
+        }
+    }
 }
 
 #[test]
@@ -287,10 +302,7 @@ fn agreement_holds_for_patterns_needing_residual_checks() {
     if !have_gpu() {
         return;
     }
-    // A character class cannot be expressed by the prefilter, so these exercise
-    // the residual path on the device.
     assert_device_agrees_with_host("[ab][cd]", 256, 512, 32);
-    // A wildcard between literals: positions must stay aligned.
     assert_device_agrees_with_host("a?c", 512, 512, 32);
 }
 
@@ -299,13 +311,9 @@ fn agreement_is_independent_of_table_size() {
     if !have_gpu() {
         return;
     }
-    // The table size is purely an optimisation; changing it must not change
-    // which keys are found — only how they are enumerated. Small values also
-    // exercise the degenerate case where a batch is almost all base point.
-    // 256 and above put the shared-memory offset table past 30 KB, and the
-    // per-thread fraction arrays past 40 KB of local memory; both are worth
-    // exercising because a silent shared-memory overflow would corrupt results
-    // rather than fail the launch.
+    // HALF up to 512 is where the unroll-disable pragma is load-bearing: the
+    // kernel must still compile in seconds. Small values exercise the
+    // almost-all-base-point degenerate batch.
     for half in [1u32, 2, 8, 16, 64, 128, 256, 512] {
         assert_device_agrees_with_host("ab", 64, 3000, half);
     }
@@ -351,7 +359,6 @@ fn multiple_patterns_are_all_reported() {
     host.sort_unstable();
 
     assert_eq!(device, host, "device missed or invented a pattern match");
-    // Every pattern should have been hit at least once in this much space.
     for pid in 0..sources.len() as u32 {
         assert!(
             host.iter().any(|h| h.2 == pid),

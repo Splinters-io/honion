@@ -5,3 +5,8 @@
 *.onion/
 hs_ed25519_secret_key
 hs_ed25519_public_key
+
+# Local scratch space, worktrees and generated registries — never committed.
+/.worktrees/
+/tmp/
+/DECISIONS.md

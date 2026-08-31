@@ -203,9 +203,13 @@ pub fn run_search(args: &SearchArgs) -> Result<()> {
     let mut searcher = Searcher::new(&tables, threads, args.offsets, max_hits)
         .context("preparing the GPU search")?;
     if !args.quiet {
-        let (major, minor) = searcher.compute_capability().unwrap_or((0, 0));
+        // The descriptor is cosmetic, so a failed query falls back to a
+        // placeholder rather than aborting a search that is otherwise working.
+        let device = searcher
+            .device_info()
+            .unwrap_or_else(|_| honion_gpu::DeviceInfo::unknown());
         eprintln!(
-            "  device compute capability {major}.{minor}, {} threads, \
+            "  device {device}, {} threads, \
              {} offsets ({} candidates per inversion, {:.1} GB device memory)",
             searcher.num_threads(),
             searcher.half(),

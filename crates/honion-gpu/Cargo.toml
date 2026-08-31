@@ -1,22 +1,151 @@
 [package]
 name = "honion-gpu"
-description = "CUDA search kernel and its host driver, plus the differential tests that gate it."
+description = "Multi-backend (CUDA/Metal) search kernel and host driver, plus the differential tests that gate it."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+# @decision DEC-BACKEND-002
+# @title `cuda`/`metal` optional non-default features; both device bindings optional deps
+# @status accepted
+# @rationale Lets the crate build on Linux+NVIDIA and macOS+Apple-Silicon
+#   without requiring the other platform's toolchain. `cudarc` stops being a
+#   hard dependency (it cannot build on macOS today); `objc2-metal` is the
+#   mirror image on Linux. `honion-cli/Cargo.toml` selects exactly one of
+#   these per platform via `[target.'cfg(...)'.dependencies]`, so a normal
+#   `cargo build`/`cargo test` of the workspace never needs both toolchains at
+#   once. See `src/lib.rs` for the `compile_error!` that fires if a consumer
+#   enables neither.
+[features]
+cuda = ["dep:cudarc"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 
 [dependencies]
 honion-core.workspace = true
-cudarc = { version = "0.19", default-features = false, features = ["cuda-13010", "driver", "nvrtc", "dynamic-loading"] }
 thiserror.workspace = true
 zeroize.workspace = true
+
+# NVIDIA backend. `dynamic-loading` means the crate links against the CUDA
+# driver at run time via `dlopen`, not at build time, so it can even be
+# *compiled* on a machine with no CUDA toolkit installed (only the `nvrtc`
+# feature needs the NVRTC shared library present, and only at run time).
+cudarc = { version = "0.19", default-features = false, features = ["cuda-13010", "driver", "nvrtc", "dynamic-loading"], optional = true }
+
+# Metal backend (Apple Silicon). `objc2-metal` is the maintained binding;
+# `metal-rs` is deprecated and its own repository recommends objc2-metal
+# (DEC-BACKEND-003). The whole driver rides on it: `src/msl.rs` uses it for
+# runtime library compilation, compute pipelines, shared buffers and command
+# queues, and `src/search/metal.rs` for the device query behind `DeviceInfo`.
+# The feature list below is the exact protocol surface those two use — kept
+# minimal so a build failure names the protocol that moved.
+objc2 = { version = "0.6", default-features = false, optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"], optional = true }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLPipeline",
+    "MTLTypes",
+], optional = true }
 
 [dev-dependencies]
 num-bigint = "0.4"
 num-traits = "0.2"
 curve25519-dalek.workspace = true
 rand = "0.9"
+
+# The differential/search-kernel test suites drive CUDA directly (they compile
+# and launch raw test kernels, not just the `Searcher` facade), so they are
+# meaningless without the `cuda` feature and cannot even name their types
+# without it. `required-features` skips building them entirely — not just
+# skipping at run time — when `cuda` is off, e.g. on a macOS/`metal` build.
+# Each test's own `Harness::new()` still does the finer-grained "no CUDA
+# *device* present" runtime skip when `cuda` is on but no GPU is attached
+# (see e.g. tests/field_arithmetic.rs); that mechanism is unchanged.
+[[test]]
+name = "field_arithmetic"
+path = "tests/field_arithmetic.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "group_arithmetic"
+path = "tests/group_arithmetic.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "search_kernel"
+path = "tests/search_kernel.rs"
+required-features = ["cuda"]
+
+# The mirror image of the block above, for the Metal backend.
+#
+# The Metal runtime driver: runtime MSL compile, closed-include resolution,
+# shared-buffer readback, bounds-checked dispatch. Needs the metal feature; the
+# device-touching tests skip cleanly without a GPU.
+[[test]]
+name = "msl_driver"
+path = "tests/msl_driver.rs"
+required-features = ["metal"]
+
+# Differential test of the Metal field arithmetic against num-bigint — the same
+# bar the CUDA field meets. Needs the metal feature; skips cleanly without a GPU.
+[[test]]
+name = "field_arithmetic_metal"
+path = "tests/field_arithmetic_metal.rs"
+required-features = ["metal"]
+
+# Differential test of the Metal group arithmetic against curve25519-dalek —
+# the same bar the CUDA curve meets. Needs the metal feature; skips without a GPU.
+[[test]]
+name = "group_arithmetic_metal"
+path = "tests/group_arithmetic_metal.rs"
+required-features = ["metal"]
+
+# End-to-end search kernel: set-equality against the host reference, plus the
+# second compiler-trap verification (HALF up to 512 must still compile fast).
+# Needs the metal feature; skips cleanly without a GPU.
+[[test]]
+name = "search_kernel_metal"
+path = "tests/search_kernel_metal.rs"
+required-features = ["metal"]
+
+# Same reasoning as the tests above: these are NVRTC/PTX inspection tools with
+# no Metal analog yet (REQ-NOGO-005 defers that), so they only make sense
+# under `cuda`.
+[[example]]
+name = "bench_metal"
+path = "examples/bench_metal.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "attrib"
+path = "examples/attrib.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "compile_check"
+path = "examples/compile_check.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "ptxmix"
+path = "examples/ptxmix.rs"
+required-features = ["cuda"]
 
 [lints.rust]
 missing_docs = "warn"

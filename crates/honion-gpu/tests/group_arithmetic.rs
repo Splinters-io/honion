@@ -30,6 +30,13 @@ struct Harness {
 
 impl Harness {
     fn new() -> Option<Self> {
+        // Ask before touching cudarc: with no driver library installed it
+        // panics out of a `OnceLock` initialiser rather than returning an
+        // error, so the `Err` arm below never gets the chance to skip.
+        if !honion_gpu::search::cuda::driver_present() {
+            eprintln!("skipping: no CUDA driver library present");
+            return None;
+        }
         let ctx = match CudaContext::new(0) {
             Ok(c) => c,
             Err(e) => {

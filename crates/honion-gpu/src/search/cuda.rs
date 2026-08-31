@@ -1,35 +1,30 @@
-//! Driving the search kernel.
+//! The CUDA backend: NVRTC-compiled kernel driven through `cudarc`.
 //!
-//! # What crosses the boundary
-//!
-//! Into the device: compressed public keys (32 bytes each), and the integer
-//! tables built by [`crate::tables`]. Out of the device: `(thread, iteration,
-//! pattern)` triples and a status word.
-//!
-//! No secret goes in and no key comes out. The caller holds the secret scalars
-//! that generated the starting points, and reconstructs a hit's secret as
-//! `a0[thread] + 8 * iteration` from its own memory. This is why the kernel can
-//! be treated as an untrusted accelerator: the worst a broken one can do is
-//! waste time or report candidates that fail verification.
+//! This is the reference backend — the one the differential test suites gate
+//! and the benchmark numbers in `docs/` describe. Backend-neutral types (what
+//! a [`Hit`] is, what a launch produces) live in the parent module; this file
+//! holds everything that actually needs a CUDA driver under it.
+
+// @decision DEC-BACKEND-001 (see search/mod.rs)
+// @title CUDA driver code moves verbatim behind the backend seam
+// @status accepted
+// @rationale This file is `search.rs` as it stood before the Metal initiative,
+//   with three deliberate changes and no others: shared types (`Hit`,
+//   `LaunchOutcome`, `SearchError`, `DEFAULT_HALF`, `candidates_per_batch`)
+//   are imported from the parent instead of defined here; `device_info()` is
+//   added so the CLI can print a backend-neutral descriptor (DEC-BACKEND-008);
+//   and `FE_LIMBS`/`BLOCK_SIZE`/`local_bytes_per_thread` stay here because
+//   they describe *this* kernel's representation, which the Metal backend is
+//   free to choose differently (DEC-METAL-004). Keeping the move verbatim
+//   makes the seam auditable: `git log --follow` shows a rename, not a rewrite.
 
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 
+use super::{DeviceInfo, Hit, LaunchOutcome, SearchError, candidates_per_batch};
 use crate::nvrtc;
 use crate::tables::DeviceTables;
-
-/// Positive offsets in the kernel's precomputed table.
-///
-/// Each offset yields two candidates — `base + off` and `base - off` — via the
-/// dual addition law, so a batch covers `2 * HALF + 1` candidates: the base
-/// point and `HALF` pairs either side of it.
-///
-/// Compiled into the kernel, so changing it changes the generated code rather
-/// than a runtime parameter. Larger values amortise the batch's single modular
-/// inversion further, but need proportionally more per-thread local memory and
-/// more shared memory for the table, both of which cost occupancy.
-pub const DEFAULT_HALF: u32 = 512;
 
 /// Limbs per field element in the device's field representation.
 ///
@@ -43,14 +38,41 @@ pub const FE_LIMBS: usize = 8;
 /// differential suite against both implementations.
 const FE_RADIX32: &str = "1";
 
-/// Candidates a thread examines per batch, for a given `half`.
-#[must_use]
-pub const fn candidates_per_batch(half: u32) -> u32 {
-    2 * half + 1
-}
-
 /// Threads per block. 256 matches the kernel's `__launch_bounds__`.
 pub const BLOCK_SIZE: u32 = 256;
+
+/// Whether the CUDA driver library is present and loadable.
+///
+/// `cudarc`'s `dynamic-loading` feature `dlopen`s libcuda on first use and
+/// **panics** when it is absent — there is no `Result` path for "no NVIDIA
+/// driver installed", because the load happens inside a `OnceLock` initialiser
+/// (`cudarc::panic_no_lib_found`). So `CudaContext::new` cannot report that
+/// case as an error: it aborts the process instead. Every entry point that is
+/// about to touch the driver has to ask this first.
+///
+/// Note what this does *not* mean: a true answer says the driver library
+/// loaded, not that a usable GPU is attached. Context creation still has to be
+/// tried, and it can still fail normally afterwards.
+#[must_use]
+pub fn driver_present() -> bool {
+    // Safety: `is_culib_present` only attempts `dlopen` on a fixed list of
+    // library names and reports whether one resolved. It dereferences no
+    // pointer and calls no driver entry point.
+    unsafe { cudarc::driver::sys::is_culib_present() }
+}
+
+/// Create a context on device 0, reporting a missing driver as an error.
+///
+/// The pre-check in [`driver_present`] is what keeps this a `Result` rather
+/// than a panic on a machine with no NVIDIA driver.
+fn context() -> Result<Arc<CudaContext>, SearchError> {
+    if !driver_present() {
+        return Err(SearchError::Driver(
+            "no CUDA driver library could be loaded; is the NVIDIA driver installed?".into(),
+        ));
+    }
+    CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))
+}
 
 /// Bytes of device-local memory each thread needs, for a given `half`.
 ///
@@ -77,7 +99,7 @@ pub const fn local_bytes_per_thread(half: u32) -> u64 {
 ///
 /// If the device cannot be queried.
 pub fn auto_threads(half: u32) -> Result<u32, SearchError> {
-    let ctx = CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+    let ctx = context()?;
     let (free, _total) = ctx
         .mem_get_info()
         .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -91,47 +113,11 @@ pub fn auto_threads(half: u32) -> Result<u32, SearchError> {
     Ok((blocks as u32) * BLOCK_SIZE)
 }
 
-/// A candidate the device believes matches.
-///
-/// "Believes" is exact: this is a claim to be checked, not a result. The
-/// `pattern_id` in particular is advisory — verification re-derives which
-/// patterns actually match rather than trusting it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(C)]
-pub struct Hit {
-    /// Index of the thread that found it; selects the starting scalar.
-    pub thread_id: u32,
-    /// Signed step count from that thread's starting scalar: the `m` in
-    /// `a = a0 + 8m`.
-    ///
-    /// Signed because the search covers a symmetric range either side of each
-    /// starting point — the dual addition law produces `base + off` and
-    /// `base - off` together — so a match may lie below where the thread
-    /// started.
-    pub offset: i32,
-    /// Which pattern the device matched. Advisory.
-    pub pattern_id: u32,
-    /// Padding, so the layout matches the device struct exactly.
-    pub reserved: u32,
-}
-
 // Status bits the kernel raises. Kept in sync with `cuda/search.cu` by
 // `status_bits_match_the_kernel` in the integration tests.
 const STATUS_BAD_START_POINT: u32 = 1;
 const STATUS_HIT_OVERFLOW: u32 = 2;
 const STATUS_SINGULAR: u32 = 4;
-
-/// What one launch produced.
-#[derive(Clone, Debug)]
-pub struct LaunchOutcome {
-    /// Candidates to verify.
-    pub hits: Vec<Hit>,
-    /// Candidates the device found, which may exceed `hits.len()` if the
-    /// buffer overflowed.
-    pub total_found: u32,
-    /// Public keys examined.
-    pub examined: u64,
-}
 
 /// A configured search: compiled kernel, uploaded tables, allocated buffers.
 pub struct Searcher {
@@ -183,7 +169,7 @@ impl Searcher {
                 "half must be positive; it is the number of precomputed offsets".into(),
             ));
         }
-        let ctx = CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        let ctx = context()?;
         let (major, minor) = ctx
             .compute_capability()
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -320,6 +306,10 @@ impl Searcher {
 
     /// The device's compute capability.
     ///
+    /// CUDA-only by design: the backend-neutral way to describe the device is
+    /// [`Self::device_info`]. This survives for the tests and tools that
+    /// genuinely mean CUDA.
+    ///
     /// # Errors
     ///
     /// If the device cannot be queried.
@@ -327,6 +317,24 @@ impl Searcher {
         self.ctx
             .compute_capability()
             .map_err(|e| SearchError::Driver(format!("{e:?}")))
+    }
+
+    /// Describe the device this search runs on.
+    ///
+    /// # Errors
+    ///
+    /// If the device cannot be queried.
+    pub fn device_info(&self) -> Result<DeviceInfo, SearchError> {
+        let name = self
+            .ctx
+            .name()
+            .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        let (major, minor) = self.compute_capability()?;
+        Ok(DeviceInfo {
+            backend: "CUDA",
+            name,
+            detail: format!("compute capability {major}.{minor}"),
+        })
     }
 
     /// Install the starting points for the next launches.
@@ -506,29 +514,4 @@ impl Searcher {
                 * u64::from(per_batch),
         })
     }
-}
-
-/// Why a search could not be set up or run.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SearchError {
-    /// The CUDA driver reported a failure.
-    #[error("CUDA driver error: {0}")]
-    Driver(String),
-    /// Device code failed to compile.
-    #[error(transparent)]
-    Nvrtc(#[from] nvrtc::NvrtcError),
-    /// The kernel raised a status flag.
-    #[error("device reported a fault: {0}")]
-    Device(String),
-    /// A construction parameter was out of range.
-    #[error("{0}")]
-    BadParameter(String),
-    /// The wrong number of starting points was supplied.
-    #[error("expected {expected} starting points, got {found}")]
-    WrongPointCount {
-        /// Points the searcher was configured for.
-        expected: usize,
-        /// Points supplied.
-        found: usize,
-    },
 }
