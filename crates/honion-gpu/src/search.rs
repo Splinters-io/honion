@@ -43,6 +43,10 @@ pub const FE_LIMBS: usize = 8;
 /// differential suite against both implementations.
 const FE_RADIX32: &str = "1";
 
+/// Minimum compute capability required for the warp-cooperative kernel path.
+/// CC 7.0 (Volta) is the floor for `__shfl_sync` and IADD3.
+pub const MIN_CC_COOPERATIVE: (u32, u32) = (7, 0);
+
 /// Candidates a thread examines per batch, for a given `half`.
 #[must_use]
 pub const fn candidates_per_batch(half: u32) -> u32 {
@@ -164,6 +168,18 @@ pub struct Searcher {
 impl Searcher {
     /// Compile the kernel for the present device and upload `tables`.
     ///
+    /// Equivalent to [`Self::with_options`] with default settings.
+    pub fn new(
+        tables: &DeviceTables,
+        num_threads: u32,
+        half: u32,
+        max_hits: u32,
+    ) -> Result<Self, SearchError> {
+        Self::with_options(tables, num_threads, half, max_hits, &SearchOptions::default())
+    }
+
+    /// Compile the kernel for the present device with tuning options.
+    ///
     /// `num_threads` is how many independent walks run concurrently; it should
     /// be a large multiple of [`BLOCK_SIZE`]. `max_hits` bounds the per-launch
     /// hit buffer.
@@ -172,11 +188,12 @@ impl Searcher {
     ///
     /// If no CUDA device is present, the kernel fails to compile, or a device
     /// allocation fails.
-    pub fn new(
+    pub fn with_options(
         tables: &DeviceTables,
         num_threads: u32,
         half: u32,
         max_hits: u32,
+        opts: &SearchOptions,
     ) -> Result<Self, SearchError> {
         if half == 0 {
             return Err(SearchError::BadParameter(
@@ -187,15 +204,35 @@ impl Searcher {
         let (major, minor) = ctx
             .compute_capability()
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        let cc = (major.max(0) as u32, minor.max(0) as u32);
 
-        // Compile with the batch size baked in, so the kernel's local-memory
-        // arrays and unrolling are fixed at compile time rather than being
-        // dynamic. This is the payoff for compiling at run time.
-        let ptx = nvrtc::compile_cached(
-            nvrtc::sources::SEARCH,
-            (major.max(0) as u32, minor.max(0) as u32),
-            &[("HALF", half.to_string()), ("FE_RADIX32", FE_RADIX32.to_owned())],
-        )?;
+        if let Some(min) = opts.min_cc {
+            if cc.0 < min.0 || (cc.0 == min.0 && cc.1 < min.1) {
+                return Err(SearchError::BadParameter(format!(
+                    "device compute capability {}.{} is below the required minimum {}.{}",
+                    cc.0, cc.1, min.0, min.1,
+                )));
+            }
+        }
+
+        let mut defines = vec![
+            ("HALF", half.to_string()),
+            ("FE_RADIX32", FE_RADIX32.to_owned()),
+        ];
+        if opts.predicate_carry {
+            defines.push(("FE_PREDICATE_CARRY", "1".to_owned()));
+        }
+
+        let mut extra_opts = Vec::new();
+        if let Some(cap) = opts.max_registers {
+            extra_opts.push(format!("--maxrregcount={cap}"));
+        }
+
+        let ptx = if extra_opts.is_empty() {
+            nvrtc::compile_cached(nvrtc::sources::SEARCH, cc, &defines)?
+        } else {
+            nvrtc::compile_with_options(nvrtc::sources::SEARCH, cc, &defines, &extra_opts)?
+        };
         let module = ctx
             .load_module(ptx.into())
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -531,4 +568,66 @@ pub enum SearchError {
         /// Points supplied.
         found: usize,
     },
+}
+
+/// Tuning options for kernel compilation experiments.
+///
+/// All fields default to `None` / `false`, which reproduces the baseline
+/// kernel. Each option is designed to be toggled independently so that its
+/// effect can be measured in isolation.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    /// Enforce a minimum compute capability, rejecting older devices.
+    pub min_cc: Option<(u32, u32)>,
+
+    /// Cap registers per thread via NVRTC's `--maxrregcount`. Forces the
+    /// compiler to spill to local memory when it would otherwise exceed this
+    /// count. Useful for testing whether the occupancy gain from more
+    /// blocks/SM outweighs the spill cost.
+    ///
+    /// The baseline kernel uses ~128 registers (2 blocks/SM on Blackwell).
+    /// 85 would allow 3 blocks/SM; 64 would allow 4.
+    pub max_registers: Option<u32>,
+
+    /// Compile with the predicate-carry field multiply variant. Uses
+    /// predicate registers and `setp` instead of hardware carry chains,
+    /// trading more instructions for more scheduling freedom.
+    pub predicate_carry: bool,
+}
+
+/// Device information for diagnostics and experiment selection.
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    /// Major and minor compute capability, e.g. `(12, 0)`.
+    pub compute_capability: (u32, u32),
+    /// Number of streaming multiprocessors.
+    pub sm_count: u32,
+    /// Total device memory in bytes.
+    pub total_memory_bytes: u64,
+    /// Free device memory in bytes at the time of the query.
+    pub free_memory_bytes: u64,
+}
+
+/// Query the present device without compiling or allocating anything.
+///
+/// # Errors
+///
+/// If no CUDA device is present.
+pub fn device_info() -> Result<DeviceInfo, SearchError> {
+    let ctx = CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+    let (major, minor) = ctx
+        .compute_capability()
+        .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+    let (free, total) = ctx
+        .mem_get_info()
+        .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+    let sm_count = ctx
+        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+    Ok(DeviceInfo {
+        compute_capability: (major.max(0) as u32, minor.max(0) as u32),
+        sm_count: sm_count.max(0) as u32,
+        total_memory_bytes: total as u64,
+        free_memory_bytes: free as u64,
+    })
 }

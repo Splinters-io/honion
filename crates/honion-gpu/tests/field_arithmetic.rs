@@ -375,3 +375,42 @@ fn predicates_match_the_canonical_encoding() {
         assert_eq!(out[2 * i + 1], canonical[0] & 1, "fe_isnegative at case {i}");
     }
 }
+
+/// The predicate-carry field multiply against the same bigint reference.
+///
+/// Gated by `FE_PREDICATE_CARRY`: uses comparison-based overflow detection
+/// instead of hardware carry chains, trading more instructions for more
+/// scheduling freedom. Must produce bit-identical results.
+#[test]
+fn field_arithmetic_predicate_carry_matches_bigint_reference() {
+    let Some(h) = Harness::with_defines(&[
+        ("FE_RADIX32", "1".to_owned()),
+        ("FE_PREDICATE_CARRY", "1".to_owned()),
+    ]) else {
+        return;
+    };
+    run_field_suite(&h);
+}
+
+#[test]
+fn predicate_carry_multiplication_on_unnormalised_limbs() {
+    let Some(h) = Harness::with_defines(&[
+        ("FE_RADIX32", "1".to_owned()),
+        ("FE_PREDICATE_CARRY", "1".to_owned()),
+    ]) else {
+        return;
+    };
+    let a = test_inputs(CASES, 3);
+    let b = test_inputs(CASES, 4);
+    let paired: Vec<([u8; 32], Option<[u8; 32]>)> =
+        a.iter().zip(&b).map(|(x, y)| (*x, Some(*y))).collect();
+
+    let got = h.run_binary("test_fe_mul_unnormalised", &a, &b, None);
+    assert_agrees("predicate-carry (a+b)*(a-b)", &paired, &got, |x, y| {
+        let y = y.expect("binary");
+        let m = modulus();
+        let sum = (x + y) % &m;
+        let diff = (x + &m - y) % &m;
+        (sum * diff) % m
+    });
+}

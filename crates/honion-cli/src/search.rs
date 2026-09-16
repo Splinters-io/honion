@@ -74,6 +74,17 @@ pub struct SearchArgs {
     /// Suppress progress output.
     #[arg(long, short)]
     quiet: bool,
+
+    /// [Experiment] Cap registers per thread. Forces spilling to local memory
+    /// when the compiler would use more. Try 96, 85, or 80 to test whether
+    /// occupancy gains outweigh spill cost. The baseline uses ~128.
+    #[arg(long, value_name = "N", hide = true)]
+    max_registers: Option<u32>,
+
+    /// [Experiment] Use predicate-carry field multiply instead of hardware
+    /// carry chains. More instructions but more scheduling freedom.
+    #[arg(long, hide = true)]
+    predicate_carry: bool,
 }
 
 /// Arguments to `honion estimate`.
@@ -200,7 +211,12 @@ pub fn run_search(args: &SearchArgs) -> Result<()> {
     // The hit buffer is sized for a very unlucky launch. Overflow is reported
     // rather than silent, but it should never happen.
     let max_hits = 4096u32;
-    let mut searcher = Searcher::new(&tables, threads, args.offsets, max_hits)
+    let opts = honion_gpu::SearchOptions {
+        max_registers: args.max_registers,
+        predicate_carry: args.predicate_carry,
+        ..Default::default()
+    };
+    let mut searcher = Searcher::with_options(&tables, threads, args.offsets, max_hits, &opts)
         .context("preparing the GPU search")?;
     if !args.quiet {
         let (major, minor) = searcher.compute_capability().unwrap_or((0, 0));

@@ -150,6 +150,7 @@ __device__ __forceinline__ void fe_neg(fe h, const fe f) {
 def gen_mul():
     out = []
     out.append(r'''
+#ifndef FE_PREDICATE_CARRY
 // h = f * g (mod 2^255 - 19).
 //
 // Schoolbook 8x8, one generated asm block per row. Each row runs two carry
@@ -229,6 +230,75 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     // each. `top` is small (below 2^6), so 38*top cannot overflow a limb.
     fe_fold_carry(h, top * 38u);
 }
+#else // FE_PREDICATE_CARRY
+// Predicate-carry field multiply: uses `mul`/`add` and overflow detection via
+// comparison instead of the hardware carry flag. More instructions, but the
+// scheduler can interleave independent chains because no carry flag serialises
+// them. See gECC (arxiv 2501.03245) for the approach.
+__device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
+    u32 r[17];
+#pragma unroll
+    for (int i = 0; i < 17; i++) r[i] = 0;
+
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        u32 carry = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            u32 lo, hi;
+            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(f[i]), "r"(g[j]));
+            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(f[i]), "r"(g[j]));
+            u32 prev = r[i + j];
+            u32 sum = prev + lo;
+            u32 c1 = (sum < prev) ? 1u : 0u;
+            prev = sum;
+            sum = prev + carry;
+            u32 c2 = (sum < prev) ? 1u : 0u;
+            r[i + j] = sum;
+            carry = hi + c1 + c2;
+        }
+        r[i + 8] += carry;
+    }
+
+    u32 c[9];
+#pragma unroll
+    for (int i = 0; i < 9; i++) c[i] = 0;
+    {
+        u32 carry = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            u32 lo, hi;
+            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(r[8 + i]), "r"(38u));
+            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(r[8 + i]), "r"(38u));
+            u32 prev = c[i];
+            u32 sum = prev + lo;
+            u32 c1 = (sum < prev) ? 1u : 0u;
+            prev = sum;
+            sum = prev + carry;
+            u32 c2 = (sum < prev) ? 1u : 0u;
+            c[i] = sum;
+            carry = hi + c1 + c2;
+        }
+        c[8] = carry;
+    }
+    {
+        u32 carry = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            u32 prev = r[i];
+            u32 sum = prev + c[i];
+            u32 c1 = (sum < prev) ? 1u : 0u;
+            prev = sum;
+            sum = prev + carry;
+            u32 c2 = (sum < prev) ? 1u : 0u;
+            h[i] = sum;
+            carry = c1 + c2;
+        }
+        u32 top = c[8] + carry;
+        fe_fold_carry(h, top * 38u);
+    }
+}
+#endif // FE_PREDICATE_CARRY
 
 // h = f * f. Squaring admits a symmetry optimisation, but it is used almost
 // only inside the exponentiation ladder, whose cost is amortised across a whole
