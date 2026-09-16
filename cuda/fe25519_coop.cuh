@@ -210,15 +210,25 @@ __device__ __forceinline__ void fe_mul_coop(u32 &h, u32 f, u32 g) {
     coop_carry_prop(r0, r1, r2, lane);
 
     // Fold carry-out from lane 7 (multiples of 2^256 ≡ 38 mod p).
+    // The carry is a 64-bit value (c0 + c1·2^32) that can be large (c0 up
+    // to ~2^32 from the accumulated 96-bit carries). Compute 38 × carry as
+    // a 64-bit result and distribute across lanes 0 and 1.
     u32 top_c0 = __shfl_sync(COOP_FULL_MASK, r1, COOP_WIDTH - 1, COOP_WIDTH);
     u32 top_c1 = __shfl_sync(COOP_FULL_MASK, r2, COOP_WIDTH - 1, COOP_WIDTH);
+
+    u32 fold_lo, fold_hi;
+    asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(fold_lo) : "r"(top_c0), "r"(38u));
+    asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(fold_hi) : "r"(top_c0), "r"(38u));
+    fold_hi += top_c1 * 38u;
+
     u32 carry = 0;
     if (lane == 0) {
-        // top_c0 is small (≤ ~360 after carry prop), 38*top_c0 fits in u32.
-        // top_c1 is 0 after 7 rounds of carry prop on small values.
-        u32 folded = top_c0 * 38u + top_c1 * 38u;
         prev = r0;
-        r0 += folded;
+        r0 += fold_lo;
+        carry = (r0 < prev) ? 1u : 0u;
+    } else if (lane == 1) {
+        prev = r0;
+        r0 += fold_hi;
         carry = (r0 < prev) ? 1u : 0u;
     }
     coop_carry_prop1(r0, carry, lane);
