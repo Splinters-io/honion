@@ -231,16 +231,17 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     fe_fold_carry(h, top * 38u);
 }
 #else // FE_PREDICATE_CARRY
-// Predicate-carry field multiply: uses `mad.lo/hi` and overflow detection via
-// comparison instead of the hardware carry flag. Fewer instructions than the
-// separate mul+add approach, and the scheduler can interleave independent
-// chains because no carry flag serialises them. See gECC (arxiv 2501.03245).
+// Predicate-carry field multiply: uses `mul.lo/hi` and overflow detection via
+// comparison instead of the hardware carry flag. The scheduler can interleave
+// independent chains because no carry flag serialises them. See gECC (arxiv
+// 2501.03245) for the approach.
 //
-// Key optimisations over a naive predicate-carry implementation:
-//  - mad.lo/hi fuses the multiply and accumulator addition, eliminating one
-//    overflow comparison per inner iteration (~33% fewer inner-loop insns).
-//  - Single-pass reduction: h[i] = r[i] + 38*r[8+i] + carry in one loop,
-//    eliminating the intermediate c[9] array and a second loop entirely.
+// NOTE: mad.lo/hi CANNOT replace mul+add here. PTX defines mad.hi.u32 as
+// mul.hi(a,b)+c, NOT (a*b+c)>>32 — the carry from the low addition does not
+// propagate into the high word.
+//
+// Single-pass reduction merges the 38× multiply and the r[0..8] addition,
+// eliminating the intermediate c[9] array and a second loop.
 __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     u32 r[17];
 #pragma unroll
@@ -251,14 +252,17 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         u32 carry = 0;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            u32 prev = r[i + j];
             u32 lo, hi;
-            asm volatile("mad.lo.u32 %0, %1, %2, %3;" : "=r"(lo) : "r"(f[i]), "r"(g[j]), "r"(prev));
-            asm volatile("mad.hi.u32 %0, %1, %2, %3;" : "=r"(hi) : "r"(f[i]), "r"(g[j]), "r"(prev));
-            u32 sum = lo + carry;
-            u32 c = (sum < lo) ? 1u : 0u;
+            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(f[i]), "r"(g[j]));
+            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(f[i]), "r"(g[j]));
+            u32 prev = r[i + j];
+            u32 sum = prev + lo;
+            u32 c1 = (sum < prev) ? 1u : 0u;
+            prev = sum;
+            sum = prev + carry;
+            u32 c2 = (sum < prev) ? 1u : 0u;
             r[i + j] = sum;
-            carry = hi + c;
+            carry = hi + c1 + c2;
         }
         r[i + 8] += carry;
     }
@@ -270,12 +274,16 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             u32 lo, hi;
-            asm volatile("mad.lo.u32 %0, %1, %2, %3;" : "=r"(lo) : "r"(r[8 + i]), "r"(38u), "r"(r[i]));
-            asm volatile("mad.hi.u32 %0, %1, %2, %3;" : "=r"(hi) : "r"(r[8 + i]), "r"(38u), "r"(r[i]));
-            u32 sum = lo + carry;
-            u32 c = (sum < lo) ? 1u : 0u;
+            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(r[8 + i]), "r"(38u));
+            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(r[8 + i]), "r"(38u));
+            u32 prev = r[i];
+            u32 sum = prev + lo;
+            u32 c1 = (sum < prev) ? 1u : 0u;
+            prev = sum;
+            sum = prev + carry;
+            u32 c2 = (sum < prev) ? 1u : 0u;
             h[i] = sum;
-            carry = hi + c;
+            carry = hi + c1 + c2;
         }
         fe_fold_carry(h, carry * 38u);
     }
