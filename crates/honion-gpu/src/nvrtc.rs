@@ -151,16 +151,20 @@ pub fn compile_with_options(
     extra: &[String],
 ) -> Result<String, NvrtcError> {
     let expanded = expand_includes(source)?;
+    compile_expanded(&expanded, arch, defines, extra)
+}
 
+/// Compile already-expanded source to PTX.
+fn compile_expanded(
+    expanded: &str,
+    arch: (u32, u32),
+    defines: &[(&str, String)],
+    extra: &[String],
+) -> Result<String, NvrtcError> {
     let mut opts: Vec<String> = vec![
         format!("--gpu-architecture=compute_{}{}", arch.0, arch.1),
-        // Treat every function as `__device__` unless marked otherwise, so the
-        // headers need no host/device annotations they would not otherwise
-        // carry.
         "-default-device".to_owned(),
         "--std=c++17".to_owned(),
-        // Fused multiply-add reassociation is irrelevant to integer code but
-        // disabling it removes a source of surprise if float ever creeps in.
         "--fmad=false".to_owned(),
     ];
     for (name, value) in defines {
@@ -170,7 +174,7 @@ pub fn compile_with_options(
 
     let opt_refs: Vec<&str> = opts.iter().map(String::as_str).collect();
     let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(
-        &expanded,
+        expanded,
         cudarc::nvrtc::safe::CompileOptions {
             options: opt_refs.iter().map(|s| (*s).to_owned()).collect(),
             ..Default::default()
@@ -201,14 +205,19 @@ fn disk_cache_path(key: u64) -> Option<PathBuf> {
 }
 
 /// Hash of everything that determines the compiled output.
-fn cache_key(source: &str, arch: (u32, u32), defines: &[(&str, String)]) -> u64 {
+///
+/// The source passed here MUST be the fully expanded text (headers inlined),
+/// not just the top-level `.cu` file. Otherwise a header change silently
+/// serves stale PTX.
+fn cache_key(expanded: &str, arch: (u32, u32), defines: &[(&str, String)]) -> u64 {
     let mut h = DefaultHasher::new();
-    source.hash(&mut h);
+    expanded.hash(&mut h);
     arch.hash(&mut h);
     defines.hash(&mut h);
-    // Bump when the compile options below change in a way the source does not
-    // capture, so old entries are not reused.
-    "v1".hash(&mut h);
+    // Bump when the compile options change in a way the source does not
+    // capture, so old entries are not reused. v1 → v2: hash expanded source
+    // instead of just the top-level file.
+    "v2".hash(&mut h);
     h.finish()
 }
 
@@ -222,27 +231,30 @@ pub fn compile_cached(
     arch: (u32, u32),
     defines: &[(&str, String)],
 ) -> Result<String, NvrtcError> {
-    let key = format!("{arch:?}|{defines:?}|{source}");
+    let expanded = expand_includes(source)?;
+    let key = cache_key(&expanded, arch, defines);
+    let mem_key = format!("{key:016x}");
+
     if let Ok(guard) = CACHE.lock()
         && let Some(map) = guard.as_ref()
-        && let Some(hit) = map.get(&key)
+        && let Some(hit) = map.get(&mem_key)
     {
         return Ok(hit.clone());
     }
 
     // Then the on-disk cache, which survives between runs.
-    let path = disk_cache_path(cache_key(source, arch, defines));
+    let path = disk_cache_path(key);
     if let Some(ref p) = path
         && let Ok(ptx) = std::fs::read_to_string(p)
         && !ptx.is_empty()
     {
         if let Ok(mut guard) = CACHE.lock() {
-            guard.get_or_insert_with(BTreeMap::new).insert(key, ptx.clone());
+            guard.get_or_insert_with(BTreeMap::new).insert(mem_key, ptx.clone());
         }
         return Ok(ptx);
     }
 
-    let ptx = compile(source, arch, defines)?;
+    let ptx = compile_expanded(&expanded, arch, defines, &[])?;
 
     // Write through a temporary and rename, so a concurrent reader never sees a
     // half-written entry. A cache write that fails is not an error: the only
@@ -258,7 +270,7 @@ pub fn compile_cached(
     }
 
     if let Ok(mut guard) = CACHE.lock() {
-        guard.get_or_insert_with(BTreeMap::new).insert(key, ptx.clone());
+        guard.get_or_insert_with(BTreeMap::new).insert(mem_key, ptx.clone());
     }
     Ok(ptx)
 }
