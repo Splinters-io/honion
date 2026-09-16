@@ -434,91 +434,53 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     fe_fold_carry(h, top * 38u);
 }
 #else // FE_PREDICATE_CARRY
-// Predicate-carry field multiply: uses `mul`/`add` and overflow detection via
-// comparison instead of the hardware carry flag. More instructions, but the
-// scheduler can interleave independent chains because no carry flag serialises
-// them. See gECC (arxiv 2501.03245) for the approach.
+// Predicate-carry field multiply: uses `mad.lo/hi` and overflow detection via
+// comparison instead of the hardware carry flag. Fewer instructions than the
+// separate mul+add approach, and the scheduler can interleave independent
+// chains because no carry flag serialises them. See gECC (arxiv 2501.03245).
 //
-// The 512-bit product is accumulated in a 17-word accumulator. Each row
-// computes f[i] * g[0..8] and adds the partial products into the accumulator
-// at positions [i..i+8], tracking overflow via predicate comparisons.
-//
-// Gated by -DFE_PREDICATE_CARRY=1 at compile time; the differential test
-// suite in tests/field_arithmetic.rs covers this variant.
+// Key optimisations over a naive predicate-carry implementation:
+//  - mad.lo/hi fuses the multiply and accumulator addition, eliminating one
+//    overflow comparison per inner iteration (~33% fewer inner-loop insns).
+//  - Single-pass reduction: h[i] = r[i] + 38*r[8+i] + carry in one loop,
+//    eliminating the intermediate c[9] array and a second loop entirely.
 __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     u32 r[17];
 #pragma unroll
     for (int i = 0; i < 17; i++) r[i] = 0;
 
-    // Schoolbook 8x8 with explicit overflow tracking.
 #pragma unroll
     for (int i = 0; i < 8; i++) {
         u32 carry = 0;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            // lo = low 32 bits of f[i] * g[j]
-            u32 lo, hi;
-            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(f[i]), "r"(g[j]));
-            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(f[i]), "r"(g[j]));
-
-            // r[i+j] += lo + carry
             u32 prev = r[i + j];
-            u32 sum = prev + lo;
-            u32 c1 = (sum < prev) ? 1u : 0u;
-            prev = sum;
-            sum = prev + carry;
-            u32 c2 = (sum < prev) ? 1u : 0u;
+            u32 lo, hi;
+            asm volatile("mad.lo.u32 %0, %1, %2, %3;" : "=r"(lo) : "r"(f[i]), "r"(g[j]), "r"(prev));
+            asm volatile("mad.hi.u32 %0, %1, %2, %3;" : "=r"(hi) : "r"(f[i]), "r"(g[j]), "r"(prev));
+            u32 sum = lo + carry;
+            u32 c = (sum < lo) ? 1u : 0u;
             r[i + j] = sum;
-
-            // carry for next position = hi + c1 + c2
-            carry = hi + c1 + c2;
+            carry = hi + c;
         }
         r[i + 8] += carry;
     }
 
-    // Reduce: h = r[0..8] + 38 * r[8..16].
-    // 2^256 = 38 (mod 2^255 - 19).
-    u32 c[9];
-#pragma unroll
-    for (int i = 0; i < 9; i++) c[i] = 0;
-
+    // Single-pass reduction: h[i] = r[i] + 38*r[8+i] + carry.
+    // 2^256 ≡ 38 (mod 2^255 - 19), so the upper half folds into the lower.
     {
         u32 carry = 0;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             u32 lo, hi;
-            asm volatile("mul.lo.u32 %0, %1, %2;" : "=r"(lo) : "r"(r[8 + i]), "r"(38u));
-            asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(hi) : "r"(r[8 + i]), "r"(38u));
-
-            u32 prev = c[i];
-            u32 sum = prev + lo;
-            u32 c1 = (sum < prev) ? 1u : 0u;
-            prev = sum;
-            sum = prev + carry;
-            u32 c2 = (sum < prev) ? 1u : 0u;
-            c[i] = sum;
-
-            carry = hi + c1 + c2;
-        }
-        c[8] = carry;
-    }
-
-    // h = r[0..8] + c[0..9]
-    {
-        u32 carry = 0;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            u32 prev = r[i];
-            u32 sum = prev + c[i];
-            u32 c1 = (sum < prev) ? 1u : 0u;
-            prev = sum;
-            sum = prev + carry;
-            u32 c2 = (sum < prev) ? 1u : 0u;
+            asm volatile("mad.lo.u32 %0, %1, %2, %3;" : "=r"(lo) : "r"(r[8 + i]), "r"(38u), "r"(r[i]));
+            asm volatile("mad.hi.u32 %0, %1, %2, %3;" : "=r"(hi) : "r"(r[8 + i]), "r"(38u), "r"(r[i]));
+            u32 sum = lo + carry;
+            u32 c = (sum < lo) ? 1u : 0u;
             h[i] = sum;
-            carry = c1 + c2;
+            carry = hi + c;
         }
-        u32 top = c[8] + carry;
-        fe_fold_carry(h, top * 38u);
+        fe_fold_carry(h, carry * 38u);
     }
 }
 
