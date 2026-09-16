@@ -35,12 +35,17 @@ __device__ __forceinline__ void coop_carry_prop(
         u32 in0 = __shfl_up_sync(COOP_FULL_MASK, c0, 1, COOP_WIDTH);
         u32 in1 = __shfl_up_sync(COOP_FULL_MASK, c1, 1, COOP_WIDTH);
         if (lane == 0) { in0 = 0; in1 = 0; }
-        c0 = 0;
-        c1 = 0;
+        // Lanes 0–6: carry was consumed by the right neighbour; reset.
+        // Lane 7: no right neighbour — accumulate incoming carries into it.
+        if (lane != COOP_WIDTH - 1) { c0 = 0; c1 = 0; }
         u32 prev = limb;
         limb += in0;
         u32 ov = (limb < prev) ? 1u : 0u;
-        c0 = in1 + ov;
+        u32 add = in1 + ov;
+        prev = c0;
+        c0 += add;
+        u32 ov2 = (c0 < prev) ? 1u : 0u;
+        c1 += ov2;
     }
 }
 
@@ -52,10 +57,10 @@ __device__ __forceinline__ void coop_carry_prop1(
     for (int round = 0; round < 7; round++) {
         u32 c_in = __shfl_up_sync(COOP_FULL_MASK, carry, 1, COOP_WIDTH);
         if (lane == 0) c_in = 0;
-        carry = 0;
+        if (lane != COOP_WIDTH - 1) carry = 0;
         u32 prev = limb;
         limb += c_in;
-        carry = (limb < prev) ? 1u : 0u;
+        carry += (limb < prev) ? 1u : 0u;
     }
 }
 
@@ -67,10 +72,10 @@ __device__ __forceinline__ void coop_borrow_prop1(
     for (int round = 0; round < 7; round++) {
         u32 b_in = __shfl_up_sync(COOP_FULL_MASK, borrow, 1, COOP_WIDTH);
         if (lane == 0) b_in = 0;
-        borrow = 0;
+        if (lane != COOP_WIDTH - 1) borrow = 0;
         u32 prev = limb;
         limb -= b_in;
-        borrow = (prev < b_in) ? 1u : 0u;
+        borrow += (prev < b_in) ? 1u : 0u;
     }
 }
 
