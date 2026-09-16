@@ -43,6 +43,8 @@ pub mod sources {
     pub const GE25519: &str = include_str!("../../../cuda/ge25519.cuh");
     /// Test-only kernels exercising individual primitives.
     pub const TESTKERNELS: &str = include_str!("../../../cuda/testkernels.cu");
+    /// Warp-cooperative field arithmetic (8 limbs across 8 warp lanes).
+    pub const FE25519_COOP: &str = include_str!("../../../cuda/fe25519_coop.cuh");
     /// The vanity search kernel.
     pub const SEARCH: &str = include_str!("../../../cuda/search.cu");
 }
@@ -56,6 +58,7 @@ fn known_headers() -> BTreeMap<&'static str, &'static str> {
     [
         ("fe25519.cuh", sources::FE25519),
         ("fe25519_u32.cuh", sources::FE25519_U32),
+        ("fe25519_coop.cuh", sources::FE25519_COOP),
         ("ge25519.cuh", sources::GE25519),
     ]
     .into_iter()

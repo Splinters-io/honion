@@ -392,6 +392,149 @@ fn field_arithmetic_predicate_carry_matches_bigint_reference() {
     run_field_suite(&h);
 }
 
+// ---------------------------------------------------------------------------
+// Cooperative field arithmetic helpers
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    /// Run a cooperative binary kernel (8 threads per element pair).
+    fn run_coop_binary(&self, name: &str, a: &[[u8; 32]], b: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let n = a.len();
+        let stream = self.ctx.default_stream();
+        let func = self.module.load_function(name).expect("kernel present");
+
+        let flat_a: Vec<u8> = a.iter().flatten().copied().collect();
+        let flat_b: Vec<u8> = b.iter().flatten().copied().collect();
+        let d_a: CudaSlice<u8> = stream.clone_htod(&flat_a).expect("upload a");
+        let d_b: CudaSlice<u8> = stream.clone_htod(&flat_b).expect("upload b");
+        let mut d_out: CudaSlice<u8> = stream.alloc_zeros(n * 32).expect("alloc out");
+
+        let n_u32 = n as u32;
+        let total_threads = n_u32 * 8;
+        let block = 256u32;
+        let grid = total_threads.div_ceil(block);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&d_a);
+        builder.arg(&d_b);
+        builder.arg(&mut d_out);
+        builder.arg(&n_u32);
+        unsafe { builder.launch(cfg) }.expect("launch");
+        stream.synchronize().expect("sync");
+
+        let flat: Vec<u8> = stream.clone_dtoh(&d_out).expect("download");
+        flat.chunks_exact(32)
+            .map(|c| {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(c);
+                r
+            })
+            .collect()
+    }
+
+    /// Run a cooperative unary kernel (8 threads per element).
+    fn run_coop_unary(&self, name: &str, a: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let n = a.len();
+        let stream = self.ctx.default_stream();
+        let func = self.module.load_function(name).expect("kernel present");
+
+        let flat_a: Vec<u8> = a.iter().flatten().copied().collect();
+        let d_a: CudaSlice<u8> = stream.clone_htod(&flat_a).expect("upload a");
+        let mut d_out: CudaSlice<u8> = stream.alloc_zeros(n * 32).expect("alloc out");
+
+        let n_u32 = n as u32;
+        let total_threads = n_u32 * 8;
+        let block = 256u32;
+        let grid = total_threads.div_ceil(block);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&d_a);
+        builder.arg(&mut d_out);
+        builder.arg(&n_u32);
+        unsafe { builder.launch(cfg) }.expect("launch");
+        stream.synchronize().expect("sync");
+
+        let flat: Vec<u8> = stream.clone_dtoh(&d_out).expect("download");
+        flat.chunks_exact(32)
+            .map(|c| {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(c);
+                r
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative field arithmetic tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cooperative_field_multiply_matches_bigint_reference() {
+    let Some(h) = Harness::with_defines(&[
+        ("FE_RADIX32", "1".to_owned()),
+        ("FE_COOP", "1".to_owned()),
+    ]) else {
+        return;
+    };
+    let a = test_inputs(CASES, 10);
+    let b = test_inputs(CASES, 11);
+
+    let mul = h.run_coop_binary("test_fe_mul_coop", &a, &b);
+    let paired: Vec<([u8; 32], Option<[u8; 32]>)> =
+        a.iter().zip(&b).map(|(x, y)| (*x, Some(*y))).collect();
+    assert_agrees("fe_mul_coop", &paired, &mul, |x, y| {
+        (x * y.expect("binary")) % modulus()
+    });
+
+    let sq = h.run_coop_unary("test_fe_sq_coop", &a);
+    let unary: Vec<([u8; 32], Option<[u8; 32]>)> = a.iter().map(|x| (*x, None)).collect();
+    assert_agrees("fe_sq_coop", &unary, &sq, |x, _| (x * x) % modulus());
+
+    let add = h.run_coop_binary("test_fe_add_coop", &a, &b);
+    assert_agrees("fe_add_coop", &paired, &add, |x, y| {
+        (x + y.expect("binary")) % modulus()
+    });
+
+    let sub = h.run_coop_binary("test_fe_sub_coop", &a, &b);
+    assert_agrees("fe_sub_coop", &paired, &sub, |x, y| {
+        (x + modulus() - y.expect("binary")) % modulus()
+    });
+}
+
+#[test]
+fn cooperative_multiply_on_unnormalised_limbs() {
+    let Some(h) = Harness::with_defines(&[
+        ("FE_RADIX32", "1".to_owned()),
+        ("FE_COOP", "1".to_owned()),
+    ]) else {
+        return;
+    };
+    let a = test_inputs(CASES, 12);
+    let b = test_inputs(CASES, 13);
+    let paired: Vec<([u8; 32], Option<[u8; 32]>)> =
+        a.iter().zip(&b).map(|(x, y)| (*x, Some(*y))).collect();
+
+    let got = h.run_coop_binary("test_fe_mul_coop_unnorm", &a, &b);
+    assert_agrees("coop (a+b)*(a-b)", &paired, &got, |x, y| {
+        let y = y.expect("binary");
+        let m = modulus();
+        let sum = (x + y) % &m;
+        let diff = (x + &m - y) % &m;
+        (sum * diff) % m
+    });
+}
+
 #[test]
 fn predicate_carry_multiplication_on_unnormalised_limbs() {
     let Some(h) = Harness::with_defines(&[

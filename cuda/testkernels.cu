@@ -104,6 +104,86 @@ extern "C" __global__ void test_fe_predicates(const u8 *a, u8 *out, unsigned n) 
 }
 
 // ---------------------------------------------------------------------------
+// Cooperative field arithmetic (FE_COOP)
+// ---------------------------------------------------------------------------
+//
+// Each cooperative group of 8 threads processes one field-element pair.
+// The launch configuration must use 8× more threads than element pairs.
+// Threads that fall outside the valid range still participate in shuffles
+// (they must not return early) but skip memory accesses.
+#ifdef FE_COOP
+#include "fe25519_coop.cuh"
+
+extern "C" __global__ void test_fe_mul_coop(const u8 *a, const u8 *b,
+                                            u8 *out, unsigned n) {
+    unsigned group = (blockIdx.x * blockDim.x + threadIdx.x) / COOP_WIDTH;
+    bool active = (group < n);
+    u32 f = 0, g = 0;
+    if (active) {
+        f = fe_frombytes_coop(a + 32 * group);
+        g = fe_frombytes_coop(b + 32 * group);
+    }
+    u32 h;
+    fe_mul_coop(h, f, g);
+    if (active) fe_tobytes_coop(out + 32 * group, h);
+}
+
+extern "C" __global__ void test_fe_sq_coop(const u8 *a, u8 *out, unsigned n) {
+    unsigned group = (blockIdx.x * blockDim.x + threadIdx.x) / COOP_WIDTH;
+    bool active = (group < n);
+    u32 f = 0;
+    if (active) f = fe_frombytes_coop(a + 32 * group);
+    u32 h;
+    fe_sq_coop(h, f);
+    if (active) fe_tobytes_coop(out + 32 * group, h);
+}
+
+extern "C" __global__ void test_fe_add_coop(const u8 *a, const u8 *b,
+                                            u8 *out, unsigned n) {
+    unsigned group = (blockIdx.x * blockDim.x + threadIdx.x) / COOP_WIDTH;
+    bool active = (group < n);
+    u32 f = 0, g = 0;
+    if (active) {
+        f = fe_frombytes_coop(a + 32 * group);
+        g = fe_frombytes_coop(b + 32 * group);
+    }
+    u32 h;
+    fe_add_coop(h, f, g);
+    if (active) fe_tobytes_coop(out + 32 * group, h);
+}
+
+extern "C" __global__ void test_fe_sub_coop(const u8 *a, const u8 *b,
+                                            u8 *out, unsigned n) {
+    unsigned group = (blockIdx.x * blockDim.x + threadIdx.x) / COOP_WIDTH;
+    bool active = (group < n);
+    u32 f = 0, g = 0;
+    if (active) {
+        f = fe_frombytes_coop(a + 32 * group);
+        g = fe_frombytes_coop(b + 32 * group);
+    }
+    u32 h;
+    fe_sub_coop(h, f, g);
+    if (active) fe_tobytes_coop(out + 32 * group, h);
+}
+
+extern "C" __global__ void test_fe_mul_coop_unnorm(const u8 *a, const u8 *b,
+                                                   u8 *out, unsigned n) {
+    unsigned group = (blockIdx.x * blockDim.x + threadIdx.x) / COOP_WIDTH;
+    bool active = (group < n);
+    u32 f = 0, g = 0;
+    if (active) {
+        f = fe_frombytes_coop(a + 32 * group);
+        g = fe_frombytes_coop(b + 32 * group);
+    }
+    u32 s, d, r;
+    fe_add_coop(s, f, g);
+    fe_sub_coop(d, f, g);
+    fe_mul_coop(r, s, d);
+    if (active) fe_tobytes_coop(out + 32 * group, r);
+}
+#endif // FE_COOP
+
+// ---------------------------------------------------------------------------
 // Group arithmetic
 // ---------------------------------------------------------------------------
 //
