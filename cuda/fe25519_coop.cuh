@@ -18,7 +18,15 @@
 #include "fe25519_u32.cuh"   // for fe, fe_frombytes, fe_tobytes, typedefs
 
 #define COOP_WIDTH 8
-#define COOP_FULL_MASK 0xFFFFFFFFu
+
+// Mask covering only this cooperative group's 8 threads within the warp.
+// With 0xFFFFFFFF all 32 warp threads must be at the same shuffle — which
+// breaks when groups diverge (active vs inactive, branches in frombytes).
+// A per-group mask lets each group's 8 threads synchronize independently.
+__device__ __forceinline__ u32 __coop_mask() {
+    return 0xFFu << ((threadIdx.x & 31) & ~(COOP_WIDTH - 1));
+}
+#define COOP_FULL_MASK __coop_mask()
 
 // ---------------------------------------------------------------------------
 // Carry / borrow propagation
@@ -316,4 +324,97 @@ __device__ __forceinline__ u32 fe_scatter(const fe src) {
 __device__ __forceinline__ void fe_gather(fe dst, u32 limb) {
     int lane = threadIdx.x & (COOP_WIDTH - 1);
     dst[lane] = limb;
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative utility functions
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void fe_1_coop(u32 &h) {
+    int lane = threadIdx.x & (COOP_WIDTH - 1);
+    h = (lane == 0) ? 1u : 0u;
+}
+
+__device__ __forceinline__ void fe_neg_coop(u32 &h, u32 f) {
+    u32 zero = 0;
+    fe_sub_coop(h, zero, f);
+}
+
+__device__ __forceinline__ u32 fe_isnonzero_coop(u32 f) {
+    u32 t = fe_freeze_coop(f);
+    #pragma unroll
+    for (int d = COOP_WIDTH / 2; d >= 1; d >>= 1)
+        t |= __shfl_xor_sync(COOP_FULL_MASK, t, d, COOP_WIDTH);
+    return t != 0;
+}
+
+__device__ __forceinline__ u32 fe_isnegative_coop(u32 f) {
+    u32 t = fe_freeze_coop(f);
+    u32 bit = __shfl_sync(COOP_FULL_MASK, t & 1u, 0, COOP_WIDTH);
+    return bit;
+}
+
+__device__ __forceinline__ u64 fe_prefix_be64_coop(u32 limb) {
+    u32 t = fe_freeze_coop(limb);
+    u32 lo = __shfl_sync(COOP_FULL_MASK, t, 0, COOP_WIDTH);
+    u32 hi = __shfl_sync(COOP_FULL_MASK, t, 1, COOP_WIDTH);
+    u32 a = __byte_perm(lo, 0, 0x0123);
+    u32 b = __byte_perm(hi, 0, 0x0123);
+    return ((u64)a << 32) | (u64)b;
+}
+
+// z^(2^252 - 3), same addition chain as scalar fe_pow22523.
+__device__ __noinline__ void fe_pow22523_coop(u32 &out, u32 z) {
+    u32 t0, t1, t2;
+    int i;
+    fe_sq_coop(t0, z);
+    fe_sq_coop(t1, t0); fe_sq_coop(t1, t1);
+    fe_mul_coop(t1, z, t1);
+    fe_mul_coop(t0, t0, t1);
+    fe_sq_coop(t0, t0);
+    fe_mul_coop(t0, t1, t0);
+    fe_sq_coop(t1, t0); for (i = 1; i < 5; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(t0, t1, t0);
+    fe_sq_coop(t1, t0); for (i = 1; i < 10; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(t1, t1, t0);
+    fe_sq_coop(t2, t1); for (i = 1; i < 20; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t1, t2, t1);
+    fe_sq_coop(t1, t1); for (i = 1; i < 10; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(t0, t1, t0);
+    fe_sq_coop(t1, t0); for (i = 1; i < 50; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(t1, t1, t0);
+    fe_sq_coop(t2, t1); for (i = 1; i < 100; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t1, t2, t1);
+    fe_sq_coop(t1, t1); for (i = 1; i < 50; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(t0, t1, t0);
+    fe_sq_coop(t0, t0); fe_sq_coop(t0, t0);
+    fe_mul_coop(out, t0, z);
+}
+
+// 1/z by Fermat: z^(p-2). Same chain as scalar fe_invert.
+__device__ __noinline__ void fe_invert_coop(u32 &out, u32 z) {
+    u32 t0, t1, t2, t3;
+    int i;
+    fe_sq_coop(t0, z);
+    fe_sq_coop(t1, t0); fe_sq_coop(t1, t1);
+    fe_mul_coop(t1, z, t1);
+    fe_mul_coop(t0, t0, t1);
+    fe_sq_coop(t2, t0);
+    fe_mul_coop(t1, t1, t2);
+    fe_sq_coop(t2, t1); for (i = 1; i < 5; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t1, t2, t1);
+    fe_sq_coop(t2, t1); for (i = 1; i < 10; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t2, t2, t1);
+    fe_sq_coop(t3, t2); for (i = 1; i < 20; i++) fe_sq_coop(t3, t3);
+    fe_mul_coop(t2, t3, t2);
+    fe_sq_coop(t2, t2); for (i = 1; i < 10; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t1, t2, t1);
+    fe_sq_coop(t2, t1); for (i = 1; i < 50; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t2, t2, t1);
+    fe_sq_coop(t3, t2); for (i = 1; i < 100; i++) fe_sq_coop(t3, t3);
+    fe_mul_coop(t2, t3, t2);
+    fe_sq_coop(t2, t2); for (i = 1; i < 50; i++) fe_sq_coop(t2, t2);
+    fe_mul_coop(t1, t2, t1);
+    fe_sq_coop(t1, t1); for (i = 1; i < 5; i++) fe_sq_coop(t1, t1);
+    fe_mul_coop(out, t1, t0);
 }

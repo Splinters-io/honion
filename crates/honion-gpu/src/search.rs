@@ -56,14 +56,27 @@ pub const fn candidates_per_batch(half: u32) -> u32 {
 /// Threads per block. 256 matches the kernel's `__launch_bounds__`.
 pub const BLOCK_SIZE: u32 = 256;
 
-/// Bytes of device-local memory each thread needs, for a given `half`.
+/// Threads per block in the small-blocks variant.
+const SMALL_BLOCK_SIZE: u32 = 128;
+
+/// Width of a cooperative group: 8 warp lanes, one per field-element limb.
+const COOP_WIDTH: u32 = 8;
+
+/// Bytes of device-local memory each walk needs, for a given `half`.
 ///
 /// One field element per candidate — the numerator — for `2 * half`
-/// candidates. Denominators are recomputed in the backward pass rather than
-/// stored, which halved this and the memory traffic with it.
+/// candidates. In the scalar kernel each thread holds 8 limbs; in the
+/// cooperative kernel the 8 limbs are spread across 8 threads, but the
+/// total per walk is the same.
+#[must_use]
+pub const fn local_bytes_per_walk(half: u32) -> u64 {
+    (2 * half as u64) * (FE_LIMBS as u64) * 4
+}
+
+/// Bytes of device-local memory each CUDA thread needs.
 #[must_use]
 pub const fn local_bytes_per_thread(half: u32) -> u64 {
-    (2 * half as u64) * (FE_LIMBS as u64) * 4
+    local_bytes_per_walk(half)
 }
 
 /// Choose a thread count that fits comfortably in free device memory.
@@ -143,6 +156,8 @@ pub struct Searcher {
     func: CudaFunction,
     half: u32,
     num_threads: u32,
+    cooperative: bool,
+    block_size: u32,
 
     // Precomputed offsets, built once on the device at construction.
     d_off_table: CudaSlice<u32>,
@@ -215,6 +230,10 @@ impl Searcher {
             }
         }
 
+        let cooperative = opts.cooperative
+            && (cc.0 > MIN_CC_COOPERATIVE.0
+                || (cc.0 == MIN_CC_COOPERATIVE.0 && cc.1 >= MIN_CC_COOPERATIVE.1));
+
         let mut defines = vec![
             ("HALF", half.to_string()),
             ("FE_RADIX32", FE_RADIX32.to_owned()),
@@ -222,6 +241,18 @@ impl Searcher {
         if opts.predicate_carry {
             defines.push(("FE_PREDICATE_CARRY", "1".to_owned()));
         }
+        if opts.small_blocks {
+            defines.push(("SMALL_BLOCKS", "1".to_owned()));
+        }
+        if opts.store_dens {
+            defines.push(("STORE_DENS", "1".to_owned()));
+        }
+
+        let source = if cooperative {
+            nvrtc::sources::SEARCH_COOP
+        } else {
+            nvrtc::sources::SEARCH
+        };
 
         let mut extra_opts = Vec::new();
         if let Some(cap) = opts.max_registers {
@@ -229,16 +260,23 @@ impl Searcher {
         }
 
         let ptx = if extra_opts.is_empty() {
-            nvrtc::compile_cached(nvrtc::sources::SEARCH, cc, &defines)?
+            nvrtc::compile_cached(source, cc, &defines)?
         } else {
-            nvrtc::compile_with_options(nvrtc::sources::SEARCH, cc, &defines, &extra_opts)?
+            nvrtc::compile_with_options(source, cc, &defines, &extra_opts)?
         };
         let module = ctx
             .load_module(ptx.into())
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        let search_name = if cooperative { "honion_search_coop" } else { "honion_search" };
         let func = module
-            .load_function("honion_search")
+            .load_function(search_name)
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        eprintln!(
+            "[kernel] {} regs={} local={}B",
+            search_name,
+            func.num_regs().unwrap_or(-1),
+            func.local_size_bytes().unwrap_or(-1),
+        );
         let build = module
             .load_function("honion_build_offsets")
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -315,11 +353,19 @@ impl Searcher {
             }
         }
 
+        let block_size = if opts.small_blocks && !cooperative {
+            SMALL_BLOCK_SIZE
+        } else {
+            BLOCK_SIZE
+        };
+
         Ok(Self {
             ctx,
             func,
             half,
             num_threads,
+            cooperative,
+            block_size,
             d_off_table,
             d_giant,
             d_group_mask,
@@ -341,6 +387,12 @@ impl Searcher {
     #[must_use]
     pub const fn num_threads(&self) -> u32 {
         self.num_threads
+    }
+
+    /// Whether the warp-cooperative kernel is active.
+    #[must_use]
+    pub const fn cooperative(&self) -> bool {
+        self.cooperative
     }
 
     /// Positive offsets in the precomputed table.
@@ -436,19 +488,25 @@ impl Searcher {
             .memset_zeros(&mut self.d_status)
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
 
+        let num_walks = self.num_threads;
+        let cuda_threads = if self.cooperative {
+            num_walks * COOP_WIDTH
+        } else {
+            num_walks
+        };
+        let bs = self.block_size;
         let cfg = LaunchConfig {
-            grid_dim: (self.num_threads.div_ceil(BLOCK_SIZE), 1, 1),
-            block_dim: (BLOCK_SIZE, 1, 1),
+            grid_dim: (cuda_threads.div_ceil(bs), 1, 1),
+            block_dim: (bs, 1, 1),
             shared_mem_bytes: 0,
         };
 
-        let num_threads = self.num_threads;
         let num_groups = self.num_groups;
         let max_hits = self.max_hits;
         let mut builder = stream.launch_builder(&self.func);
         builder
             .arg(&self.d_points)
-            .arg(&num_threads)
+            .arg(&num_walks)
             .arg(&num_batches)
             .arg(&self.d_off_table)
             .arg(&self.d_giant)
@@ -463,10 +521,11 @@ impl Searcher {
             .arg(&mut self.d_hit_count)
             .arg(&max_hits)
             .arg(&mut self.d_status);
-        // Safety: the argument list matches `honion_search`'s signature in
-        // `cuda/search.cu` exactly, in order and in type. Every buffer was
-        // allocated above at the size the kernel indexes, and the kernel bounds
-        // its thread index against `num_threads`.
+        // Safety: the argument list matches the search kernel's signature
+        // exactly, in order and in type. Every buffer was allocated at the
+        // size the kernel indexes. The scalar kernel reads `num_walks` as
+        // `num_threads`; the cooperative kernel as `num_walks` — same
+        // parameter position and meaning.
         unsafe { builder.launch(cfg) }.map_err(|e| SearchError::Driver(format!("{e:?}")))?;
         Ok(num_batches)
     }
@@ -593,6 +652,21 @@ pub struct SearchOptions {
     /// predicate registers and `setp` instead of hardware carry chains,
     /// trading more instructions for more scheduling freedom.
     pub predicate_carry: bool,
+
+    /// Use the warp-cooperative kernel (8 threads per walk). Requires
+    /// CC >= 7.0; silently falls back to the scalar kernel on older GPUs.
+    pub cooperative: bool,
+
+    /// Cache the dual-pair denominators in local memory instead of
+    /// recomputing them in the backward pass. Saves 1024 fe_mul per batch
+    /// but doubles local-memory traffic (~32 KB extra per thread).
+    pub store_dens: bool,
+
+    /// Use 128-thread blocks instead of 256, with `__launch_bounds__(128, 5)`
+    /// to target 5 blocks/SM = 20 warps. Trades shared memory for L1 cache
+    /// (the offset table is read from global/L2 instead of shared memory) so
+    /// more blocks fit.
+    pub small_blocks: bool,
 }
 
 /// Device information for diagnostics and experiment selection.

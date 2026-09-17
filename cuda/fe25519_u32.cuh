@@ -67,6 +67,7 @@ __device__ __forceinline__ void fe_copy(fe h, const fe f) {
     for (int i = 0; i < FE_LIMBS; i++) h[i] = f[i];
 }
 
+
 // Conditional move: h = b ? g : h, branch-free. `b` must be 0 or 1.
 __device__ __forceinline__ void fe_cmov(fe h, const fe g, u32 b) {
     const u32 mask = (u32)(-(i32)b);
@@ -206,19 +207,17 @@ __device__ __forceinline__ void fe_neg(fe h, const fe f) {
 // them, and the carry flag would not survive.
 __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     u32 r[17];
-#pragma unroll
-    for (int i = 0; i < 17; i++) r[i] = 0;
-    // row 0
+    // row 0 — all outputs are first-use; immediate 0 replaces the init loop
     asm volatile(
-        "mad.lo.cc.u32  %0, %10, %11, %0;\n\t"
-        "madc.lo.cc.u32 %1, %10, %12, %1;\n\t"
-        "madc.lo.cc.u32 %2, %10, %13, %2;\n\t"
-        "madc.lo.cc.u32 %3, %10, %14, %3;\n\t"
-        "madc.lo.cc.u32 %4, %10, %15, %4;\n\t"
-        "madc.lo.cc.u32 %5, %10, %16, %5;\n\t"
-        "madc.lo.cc.u32 %6, %10, %17, %6;\n\t"
-        "madc.lo.cc.u32 %7, %10, %18, %7;\n\t"
-        "addc.u32       %8, %8, 0;\n\t"
+        "mad.lo.cc.u32  %0, %10, %11, 0;\n\t"
+        "madc.lo.cc.u32 %1, %10, %12, 0;\n\t"
+        "madc.lo.cc.u32 %2, %10, %13, 0;\n\t"
+        "madc.lo.cc.u32 %3, %10, %14, 0;\n\t"
+        "madc.lo.cc.u32 %4, %10, %15, 0;\n\t"
+        "madc.lo.cc.u32 %5, %10, %16, 0;\n\t"
+        "madc.lo.cc.u32 %6, %10, %17, 0;\n\t"
+        "madc.lo.cc.u32 %7, %10, %18, 0;\n\t"
+        "addc.u32       %8, 0, 0;\n\t"
         "mad.hi.cc.u32  %1, %10, %11, %1;\n\t"
         "madc.hi.cc.u32 %2, %10, %12, %2;\n\t"
         "madc.hi.cc.u32 %3, %10, %13, %3;\n\t"
@@ -227,8 +226,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[0]), "+r"(r[1]), "+r"(r[2]), "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "=&r"(r[0]), "=&r"(r[1]), "=&r"(r[2]), "=&r"(r[3]), "=&r"(r[4]), "=&r"(r[5]), "=&r"(r[6]), "=&r"(r[7]), "=&r"(r[8]), "=&r"(r[9])
         : "r"(f[0]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 1
     asm volatile(
@@ -249,8 +248,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[1]), "+r"(r[2]), "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[1]), "+r"(r[2]), "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "=&r"(r[10])
         : "r"(f[1]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 2
     asm volatile(
@@ -271,8 +270,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[2]), "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[2]), "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "=&r"(r[11])
         : "r"(f[2]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 3
     asm volatile(
@@ -293,8 +292,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "=&r"(r[12])
         : "r"(f[3]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 4
     asm volatile(
@@ -315,8 +314,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "=&r"(r[13])
         : "r"(f[4]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 5
     asm volatile(
@@ -337,8 +336,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "+r"(r[14])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "=&r"(r[14])
         : "r"(f[5]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 6
     asm volatile(
@@ -359,8 +358,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "+r"(r[14]), "+r"(r[15])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[6]), "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "+r"(r[14]), "=&r"(r[15])
         : "r"(f[6]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
     // row 7
     asm volatile(
@@ -381,8 +380,8 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
         "madc.hi.cc.u32 %6, %10, %16, %6;\n\t"
         "madc.hi.cc.u32 %7, %10, %17, %7;\n\t"
         "madc.hi.cc.u32 %8, %10, %18, %8;\n\t"
-        "addc.u32       %9, %9, 0;\n\t"
-        : "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "+r"(r[14]), "+r"(r[15]), "+r"(r[16])
+        "addc.u32       %9, 0, 0;\n\t"
+        : "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "+r"(r[14]), "+r"(r[15]), "=&r"(r[16])
         : "r"(f[7]), "r"(g[0]), "r"(g[1]), "r"(g[2]), "r"(g[3]), "r"(g[4]), "r"(g[5]), "r"(g[6]), "r"(g[7]));
 
     // Reduce the 512-bit product. 2^256 = 38 (mod p), so the answer is
@@ -431,6 +430,216 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
 
     // `top` counts multiples of 2^256 still outstanding; fold them in as 38
     // each. `top` is small (below 2^6), so 38*top cannot overflow a limb.
+    fe_fold_carry(h, top * 38u);
+}
+
+// h = f * f (mod 2^255 - 19).
+//
+// Dedicated squaring: 36 partial products instead of 64 by exploiting
+// f[i]*f[j] = f[j]*f[i]. The 28 off-diagonal products are accumulated once,
+// doubled, and the 8 diagonal products added with a single carry chain.
+__device__ __forceinline__ void fe_sq(fe h, const fe f) {
+    u32 r[16];
+
+    // --- Off-diagonal products (28 products, i < j) ---
+
+    // row 0: f[0] × {f[1]..f[7]} — all outputs first-use
+    asm volatile(
+        "mad.lo.cc.u32  %0, %9, %10, 0;\n\t"
+        "madc.lo.cc.u32 %1, %9, %11, 0;\n\t"
+        "madc.lo.cc.u32 %2, %9, %12, 0;\n\t"
+        "madc.lo.cc.u32 %3, %9, %13, 0;\n\t"
+        "madc.lo.cc.u32 %4, %9, %14, 0;\n\t"
+        "madc.lo.cc.u32 %5, %9, %15, 0;\n\t"
+        "madc.lo.cc.u32 %6, %9, %16, 0;\n\t"
+        "addc.u32       %7, 0, 0;\n\t"
+        "mad.hi.cc.u32  %1, %9, %10, %1;\n\t"
+        "madc.hi.cc.u32 %2, %9, %11, %2;\n\t"
+        "madc.hi.cc.u32 %3, %9, %12, %3;\n\t"
+        "madc.hi.cc.u32 %4, %9, %13, %4;\n\t"
+        "madc.hi.cc.u32 %5, %9, %14, %5;\n\t"
+        "madc.hi.cc.u32 %6, %9, %15, %6;\n\t"
+        "madc.hi.cc.u32 %7, %9, %16, %7;\n\t"
+        "addc.u32       %8, 0, 0;\n\t"
+        : "=&r"(r[1]), "=&r"(r[2]), "=&r"(r[3]), "=&r"(r[4]),
+          "=&r"(r[5]), "=&r"(r[6]), "=&r"(r[7]), "=&r"(r[8]), "=&r"(r[9])
+        : "r"(f[0]),
+          "r"(f[1]), "r"(f[2]), "r"(f[3]), "r"(f[4]),
+          "r"(f[5]), "r"(f[6]), "r"(f[7]));
+    // row 1: f[1] × {f[2]..f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %8, %9,  %0;\n\t"
+        "madc.lo.cc.u32 %1, %8, %10, %1;\n\t"
+        "madc.lo.cc.u32 %2, %8, %11, %2;\n\t"
+        "madc.lo.cc.u32 %3, %8, %12, %3;\n\t"
+        "madc.lo.cc.u32 %4, %8, %13, %4;\n\t"
+        "madc.lo.cc.u32 %5, %8, %14, %5;\n\t"
+        "addc.u32       %6, %6, 0;\n\t"
+        "mad.hi.cc.u32  %1, %8, %9,  %1;\n\t"
+        "madc.hi.cc.u32 %2, %8, %10, %2;\n\t"
+        "madc.hi.cc.u32 %3, %8, %11, %3;\n\t"
+        "madc.hi.cc.u32 %4, %8, %12, %4;\n\t"
+        "madc.hi.cc.u32 %5, %8, %13, %5;\n\t"
+        "madc.hi.cc.u32 %6, %8, %14, %6;\n\t"
+        "addc.u32       %7, 0, 0;\n\t"
+        : "+r"(r[3]), "+r"(r[4]), "+r"(r[5]), "+r"(r[6]),
+          "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "=&r"(r[10])
+        : "r"(f[1]), "r"(f[2]), "r"(f[3]), "r"(f[4]),
+          "r"(f[5]), "r"(f[6]), "r"(f[7]));
+    // row 2: f[2] × {f[3]..f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %7, %8,  %0;\n\t"
+        "madc.lo.cc.u32 %1, %7, %9,  %1;\n\t"
+        "madc.lo.cc.u32 %2, %7, %10, %2;\n\t"
+        "madc.lo.cc.u32 %3, %7, %11, %3;\n\t"
+        "madc.lo.cc.u32 %4, %7, %12, %4;\n\t"
+        "addc.u32       %5, %5, 0;\n\t"
+        "mad.hi.cc.u32  %1, %7, %8,  %1;\n\t"
+        "madc.hi.cc.u32 %2, %7, %9,  %2;\n\t"
+        "madc.hi.cc.u32 %3, %7, %10, %3;\n\t"
+        "madc.hi.cc.u32 %4, %7, %11, %4;\n\t"
+        "madc.hi.cc.u32 %5, %7, %12, %5;\n\t"
+        "addc.u32       %6, 0, 0;\n\t"
+        : "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), "+r"(r[8]),
+          "+r"(r[9]), "+r"(r[10]), "=&r"(r[11])
+        : "r"(f[2]), "r"(f[3]), "r"(f[4]), "r"(f[5]),
+          "r"(f[6]), "r"(f[7]));
+    // row 3: f[3] × {f[4]..f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %6, %7,  %0;\n\t"
+        "madc.lo.cc.u32 %1, %6, %8,  %1;\n\t"
+        "madc.lo.cc.u32 %2, %6, %9,  %2;\n\t"
+        "madc.lo.cc.u32 %3, %6, %10, %3;\n\t"
+        "addc.u32       %4, %4, 0;\n\t"
+        "mad.hi.cc.u32  %1, %6, %7,  %1;\n\t"
+        "madc.hi.cc.u32 %2, %6, %8,  %2;\n\t"
+        "madc.hi.cc.u32 %3, %6, %9,  %3;\n\t"
+        "madc.hi.cc.u32 %4, %6, %10, %4;\n\t"
+        "addc.u32       %5, 0, 0;\n\t"
+        : "+r"(r[7]), "+r"(r[8]), "+r"(r[9]), "+r"(r[10]),
+          "+r"(r[11]), "=&r"(r[12])
+        : "r"(f[3]), "r"(f[4]), "r"(f[5]), "r"(f[6]), "r"(f[7]));
+    // row 4: f[4] × {f[5]..f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %5, %6, %0;\n\t"
+        "madc.lo.cc.u32 %1, %5, %7, %1;\n\t"
+        "madc.lo.cc.u32 %2, %5, %8, %2;\n\t"
+        "addc.u32       %3, %3, 0;\n\t"
+        "mad.hi.cc.u32  %1, %5, %6, %1;\n\t"
+        "madc.hi.cc.u32 %2, %5, %7, %2;\n\t"
+        "madc.hi.cc.u32 %3, %5, %8, %3;\n\t"
+        "addc.u32       %4, 0, 0;\n\t"
+        : "+r"(r[9]), "+r"(r[10]), "+r"(r[11]), "+r"(r[12]), "=&r"(r[13])
+        : "r"(f[4]), "r"(f[5]), "r"(f[6]), "r"(f[7]));
+    // row 5: f[5] × {f[6], f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %4, %5, %0;\n\t"
+        "madc.lo.cc.u32 %1, %4, %6, %1;\n\t"
+        "addc.u32       %2, %2, 0;\n\t"
+        "mad.hi.cc.u32  %1, %4, %5, %1;\n\t"
+        "madc.hi.cc.u32 %2, %4, %6, %2;\n\t"
+        "addc.u32       %3, 0, 0;\n\t"
+        : "+r"(r[11]), "+r"(r[12]), "+r"(r[13]), "=&r"(r[14])
+        : "r"(f[5]), "r"(f[6]), "r"(f[7]));
+    // row 6: f[6] × {f[7]}
+    asm volatile(
+        "mad.lo.cc.u32  %0, %3, %4, %0;\n\t"
+        "addc.u32       %1, %1, 0;\n\t"
+        "mad.hi.cc.u32  %1, %3, %4, %1;\n\t"
+        "addc.u32       %2, 0, 0;\n\t"
+        : "+r"(r[13]), "+r"(r[14]), "=&r"(r[15])
+        : "r"(f[6]), "r"(f[7]));
+
+    // --- Double the off-diagonal sum ---
+    asm volatile(
+        "add.cc.u32  %0,  %0,  %0;\n\t"
+        "addc.cc.u32 %1,  %1,  %1;\n\t"
+        "addc.cc.u32 %2,  %2,  %2;\n\t"
+        "addc.cc.u32 %3,  %3,  %3;\n\t"
+        "addc.cc.u32 %4,  %4,  %4;\n\t"
+        "addc.cc.u32 %5,  %5,  %5;\n\t"
+        "addc.cc.u32 %6,  %6,  %6;\n\t"
+        "addc.cc.u32 %7,  %7,  %7;\n\t"
+        "addc.cc.u32 %8,  %8,  %8;\n\t"
+        "addc.cc.u32 %9,  %9,  %9;\n\t"
+        "addc.cc.u32 %10, %10, %10;\n\t"
+        "addc.cc.u32 %11, %11, %11;\n\t"
+        "addc.cc.u32 %12, %12, %12;\n\t"
+        "addc.cc.u32 %13, %13, %13;\n\t"
+        "addc.u32    %14, %14, %14;\n\t"
+        : "+r"(r[1]),  "+r"(r[2]),  "+r"(r[3]),  "+r"(r[4]),
+          "+r"(r[5]),  "+r"(r[6]),  "+r"(r[7]),  "+r"(r[8]),
+          "+r"(r[9]),  "+r"(r[10]), "+r"(r[11]), "+r"(r[12]),
+          "+r"(r[13]), "+r"(r[14]), "+r"(r[15]));
+
+    // --- Add diagonal products (8 squares) ---
+    asm volatile(
+        "mad.lo.cc.u32  %0,  %16, %16, 0;\n\t"
+        "madc.hi.cc.u32 %1,  %16, %16, %1;\n\t"
+        "madc.lo.cc.u32 %2,  %17, %17, %2;\n\t"
+        "madc.hi.cc.u32 %3,  %17, %17, %3;\n\t"
+        "madc.lo.cc.u32 %4,  %18, %18, %4;\n\t"
+        "madc.hi.cc.u32 %5,  %18, %18, %5;\n\t"
+        "madc.lo.cc.u32 %6,  %19, %19, %6;\n\t"
+        "madc.hi.cc.u32 %7,  %19, %19, %7;\n\t"
+        "madc.lo.cc.u32 %8,  %20, %20, %8;\n\t"
+        "madc.hi.cc.u32 %9,  %20, %20, %9;\n\t"
+        "madc.lo.cc.u32 %10, %21, %21, %10;\n\t"
+        "madc.hi.cc.u32 %11, %21, %21, %11;\n\t"
+        "madc.lo.cc.u32 %12, %22, %22, %12;\n\t"
+        "madc.hi.cc.u32 %13, %22, %22, %13;\n\t"
+        "madc.lo.cc.u32 %14, %23, %23, %14;\n\t"
+        "madc.hi.u32    %15, %23, %23, %15;\n\t"
+        : "=&r"(r[0]),  "+r"(r[1]),  "+r"(r[2]),  "+r"(r[3]),
+          "+r"(r[4]),  "+r"(r[5]),  "+r"(r[6]),  "+r"(r[7]),
+          "+r"(r[8]),  "+r"(r[9]),  "+r"(r[10]), "+r"(r[11]),
+          "+r"(r[12]), "+r"(r[13]), "+r"(r[14]), "+r"(r[15])
+        : "r"(f[0]), "r"(f[1]), "r"(f[2]), "r"(f[3]),
+          "r"(f[4]), "r"(f[5]), "r"(f[6]), "r"(f[7]));
+
+    // --- Reduce the 512-bit square mod p (same as fe_mul) ---
+    u32 c[9];
+    asm volatile(
+        "mad.lo.cc.u32  %0, %9,  %17, 0;\n\t"
+        "madc.lo.cc.u32 %1, %10, %17, 0;\n\t"
+        "madc.lo.cc.u32 %2, %11, %17, 0;\n\t"
+        "madc.lo.cc.u32 %3, %12, %17, 0;\n\t"
+        "madc.lo.cc.u32 %4, %13, %17, 0;\n\t"
+        "madc.lo.cc.u32 %5, %14, %17, 0;\n\t"
+        "madc.lo.cc.u32 %6, %15, %17, 0;\n\t"
+        "madc.lo.cc.u32 %7, %16, %17, 0;\n\t"
+        "addc.u32       %8, 0, 0;\n\t"
+        "mad.hi.cc.u32  %1, %9,  %17, %1;\n\t"
+        "madc.hi.cc.u32 %2, %10, %17, %2;\n\t"
+        "madc.hi.cc.u32 %3, %11, %17, %3;\n\t"
+        "madc.hi.cc.u32 %4, %12, %17, %4;\n\t"
+        "madc.hi.cc.u32 %5, %13, %17, %5;\n\t"
+        "madc.hi.cc.u32 %6, %14, %17, %6;\n\t"
+        "madc.hi.cc.u32 %7, %15, %17, %7;\n\t"
+        "madc.hi.cc.u32 %8, %16, %17, %8;\n\t"
+        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]), "=r"(c[4]),
+          "=r"(c[5]), "=r"(c[6]), "=r"(c[7]), "=r"(c[8])
+        : "r"(r[8]), "r"(r[9]), "r"(r[10]), "r"(r[11]), "r"(r[12]),
+          "r"(r[13]), "r"(r[14]), "r"(r[15]), "n"(38));
+
+    u32 top;
+    asm volatile(
+        "add.cc.u32  %0, %9,  %17;\n\t"
+        "addc.cc.u32 %1, %10, %18;\n\t"
+        "addc.cc.u32 %2, %11, %19;\n\t"
+        "addc.cc.u32 %3, %12, %20;\n\t"
+        "addc.cc.u32 %4, %13, %21;\n\t"
+        "addc.cc.u32 %5, %14, %22;\n\t"
+        "addc.cc.u32 %6, %15, %23;\n\t"
+        "addc.cc.u32 %7, %16, %24;\n\t"
+        "addc.u32    %8, %25, 0;\n\t"
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3]),
+          "=r"(h[4]), "=r"(h[5]), "=r"(h[6]), "=r"(h[7]), "=r"(top)
+        : "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]),
+          "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7]),
+          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]),
+          "r"(c[4]), "r"(c[5]), "r"(c[6]), "r"(c[7]), "r"(c[8]));
+
     fe_fold_carry(h, top * 38u);
 }
 #else // FE_PREDICATE_CARRY
@@ -492,13 +701,9 @@ __device__ __forceinline__ void fe_mul(fe h, const fe f, const fe g) {
     }
 }
 
+__device__ __forceinline__ void fe_sq(fe h, const fe f) { fe_mul(h, f, f); }
 
 #endif // FE_PREDICATE_CARRY
-
-// h = f * f. Squaring admits a symmetry optimisation, but it is used almost
-// only inside the exponentiation ladder, whose cost is amortised across a whole
-// batch by Montgomery's trick.
-__device__ __forceinline__ void fe_sq(fe h, const fe f) { fe_mul(h, f, f); }
 
 
 // Load from 32 little-endian bytes. Bit 255 is masked off here, not by the

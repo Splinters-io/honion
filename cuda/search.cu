@@ -193,7 +193,11 @@ extern "C" __global__ void honion_build_offsets(u32 *__restrict__ table,
 //
 // Table layout, all built and validated on the host (langsec rule 4 — the
 // device parses nothing and reads no length out of data).
+#ifdef SMALL_BLOCKS
+extern "C" __global__ __launch_bounds__(128, 5) void honion_search(
+#else
 extern "C" __global__ __launch_bounds__(256) void honion_search(
+#endif
     const u8 *__restrict__ start_points,
     u32 num_threads,
     u32 num_batches,
@@ -211,6 +215,7 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
     u32 max_hits,
     u32 *__restrict__ status) {
 
+#ifndef SMALL_BLOCKS
     // The offset table is identical for every thread, so it is staged in shared
     // memory once per block rather than re-read from global memory by each of
     // the 2*HALF multiplications every batch performs.
@@ -219,6 +224,16 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
         s_off[i] = off_table[i];
     }
     __syncthreads();
+    const u32 *otab = s_off;
+#else
+    // With SMALL_BLOCKS the shared memory budget goes to L1 cache instead,
+    // which lets more blocks fit on an SM. The offset table (48 KB for
+    // HALF=512) fits easily in L1; the first warp's read warms the cache and
+    // every subsequent access hits at ~30 cycles, close to shared memory's
+    // ~20. The occupancy gain from 5 blocks/SM (20 warps vs 16) more than
+    // compensates.
+    const u32 *otab = off_table;
+#endif
 
     const u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_threads) return;
@@ -240,19 +255,18 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
         return;
     }
 
-    // One field element per candidate, and only the numerator.
+    // One field element per candidate: the numerator, pre-multiplied by the
+    // product of all prior denominators so that the backward pass can recover
+    // y with a single multiplication against the running inverse.
     //
-    // The denominators are *not* stored. Profiling showed this kernel is bound
-    // by local-memory bandwidth, not arithmetic: ablating a fifth of the
-    // multiplies changed throughput by 0.1%, while DRAM sat at 61% of peak
-    // moving about 106 bytes per candidate. Storing both halves of each
-    // fraction was most of that traffic.
-    //
-    // So the backward pass recomputes each denominator from the base point and
-    // the offset table — two multiplications per pair — instead of reading it
-    // back. That is one more multiplication per candidate and half the memory
-    // traffic, which on a memory-bound kernel is a trade worth making.
+    // Only the numerator is stored by default. The denominators are
+    // recomputed in the backward pass from the base point and the offset
+    // table — two multiplications per pair. STORE_DENS caches them instead,
+    // trading local-memory bandwidth for fewer multiplications.
     fe ynum[2 * HALF];
+#ifdef STORE_DENS
+    fe den_p[HALF], den_m[HALF];
+#endif
 
     // The first batch needs an affine base point, which costs one inversion.
     // Every later batch gets 1/Z out of its own batch inversion for free — see
@@ -290,7 +304,7 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
         fe_1(run_m);
 #pragma unroll 1
         for (u32 j = 0; j < HALF; j++) {
-            const u32 *slot = s_off + (size_t)j * OFF_STRIDE;
+            const u32 *slot = otab + (size_t)j * OFF_STRIDE;
             fe ox, oy, oxy;
 #pragma unroll
             for (int k = 0; k < FE_LIMBS; k++) {
@@ -303,10 +317,17 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
             ge_dual_pair(&plus, &minus, &base, ox, oy, oxy);
 
             const u32 i0 = 2 * j, i1 = 2 * j + 1;
-            fe_mul(ynum[i0], run_p, plus.num);
+            fe tmp;
+            fe_mul(tmp, run_p, plus.num);
+            fe_copy(ynum[i0], tmp);
             fe_mul(run_p, run_p, plus.den);
-            fe_mul(ynum[i1], run_m, minus.num);
+            fe_mul(tmp, run_m, minus.num);
+            fe_copy(ynum[i1], tmp);
             fe_mul(run_m, run_m, minus.den);
+#ifdef STORE_DENS
+            fe_copy(den_p[j], plus.den);
+            fe_copy(den_m[j], minus.den);
+#endif
         }
 
         // Advance to the next batch's base point while still projective, and
@@ -344,12 +365,24 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
         fe_mul(acc_m, inv_prod, run_p);
 
         // Backward pass, walking pairs in reverse so candidate indices still
-        // descend: 2j+1 then 2j. Each pair's two denominators are rebuilt from
-        // the same two products the forward pass used, rather than read back
-        // from memory.
+        // descend: 2j+1 then 2j.
 #pragma unroll 1
         for (i32 j = HALF - 1; j >= 0; j--) {
-            const u32 *slot = s_off + (size_t)j * OFF_STRIDE;
+#ifdef STORE_DENS
+            // Denominators cached from the forward pass — no recomputation.
+            const i32 step = j + 1;
+            fe y_m, y_p;
+            fe_mul(y_m, acc_m, ynum[2 * j + 1]);
+            fe_mul(y_p, acc_p, ynum[2 * j]);
+            fe_mul(acc_m, acc_m, den_m[j]);
+            fe_mul(acc_p, acc_p, den_p[j]);
+            HONION_CHECK(y_m, centre - step);
+            HONION_CHECK(y_p, centre + step);
+#else
+            // Recompute denominators from the offset table — two extra
+            // multiplications per pair, but avoids the local-memory traffic
+            // that storing them would cost.
+            const u32 *slot = otab + (size_t)j * OFF_STRIDE;
             fe ox, oy, oxy;
 #pragma unroll
             for (int k = 0; k < FE_LIMBS; k++) {
@@ -361,15 +394,14 @@ extern "C" __global__ __launch_bounds__(256) void honion_search(
             ge_dual_pair(&plus, &minus, &base, ox, oy, oxy);
 
             const i32 step = j + 1;
-            // The two chains unwind independently and interleaved, which is the
-            // whole point: neither multiplication below waits on the other.
             fe y_m, y_p;
-            fe_mul(y_m, acc_m, ynum[2 * j + 1]);   // base - (j+1)*8B
-            fe_mul(y_p, acc_p, ynum[2 * j]);       // base + (j+1)*8B
+            fe_mul(y_m, acc_m, ynum[2 * j + 1]);
+            fe_mul(y_p, acc_p, ynum[2 * j]);
             fe_mul(acc_m, acc_m, minus.den);
             fe_mul(acc_p, acc_p, plus.den);
             HONION_CHECK(y_m, centre - step);
             HONION_CHECK(y_p, centre + step);
+#endif
         }
 
         ge_p3_to_affine(&base, &point, next_zinv);

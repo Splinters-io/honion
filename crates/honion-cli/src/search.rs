@@ -85,6 +85,24 @@ pub struct SearchArgs {
     /// carry chains. More instructions but more scheduling freedom.
     #[arg(long, hide = true)]
     predicate_carry: bool,
+
+    /// [Experiment] Use the warp-cooperative kernel: 8 threads per walk,
+    /// trading shuffle overhead for 3-4x occupancy via lower register
+    /// pressure. Requires CC 7.0+.
+    #[arg(long, hide = true)]
+    cooperative: bool,
+
+    /// [Experiment] Cache dual-pair denominators in local memory instead of
+    /// recomputing them in the backward pass. Saves 1024 fe_mul per batch
+    /// but adds ~32 KB of local memory per thread.
+    #[arg(long, hide = true)]
+    store_dens: bool,
+
+    /// [Experiment] Use 128-thread blocks with __launch_bounds__(128, 5) to
+    /// fit 5 blocks/SM = 20 warps. Trades shared memory for L1 cache, giving
+    /// the scheduler more warps to hide carry-chain latency.
+    #[arg(long, hide = true)]
+    small_blocks: bool,
 }
 
 /// Arguments to `honion estimate`.
@@ -214,6 +232,9 @@ pub fn run_search(args: &SearchArgs) -> Result<()> {
     let opts = honion_gpu::SearchOptions {
         max_registers: args.max_registers,
         predicate_carry: args.predicate_carry,
+        cooperative: args.cooperative,
+        small_blocks: args.small_blocks,
+        store_dens: args.store_dens,
         ..Default::default()
     };
     let mut searcher = Searcher::with_options(&tables, threads, args.offsets, max_hits, &opts)

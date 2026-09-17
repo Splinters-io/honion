@@ -20,7 +20,7 @@ use curve25519_dalek::scalar::Scalar;
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use honion_core::address::OnionAddress;
 use honion_core::pattern::{Pattern, PatternSet};
-use honion_gpu::{DeviceTables, Searcher};
+use honion_gpu::{DeviceTables, SearchOptions, Searcher};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -351,5 +351,214 @@ fn multiple_patterns_are_all_reported() {
             "pattern {} never matched; the test is not exercising what it claims",
             sources[pid as usize]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative kernel tests
+// ---------------------------------------------------------------------------
+
+fn coop_opts() -> SearchOptions {
+    SearchOptions {
+        cooperative: true,
+        ..Default::default()
+    }
+}
+
+fn assert_coop_agrees_with_host(pattern_src: &str, threads: u32, candidates: u32, half: u32) {
+    let (scalars, points) = starting_points(threads as usize, 42);
+    let pattern = Pattern::parse(pattern_src).expect("valid pattern");
+    let set = PatternSet::compile(&[pattern]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+
+    let opts = coop_opts();
+    let mut searcher =
+        Searcher::with_options(&tables, threads, half, 1 << 16, &opts).expect("searcher");
+    assert!(searcher.cooperative(), "expected cooperative mode");
+    searcher.set_start_points(&points).expect("points");
+    let outcome = searcher.launch(candidates).expect("launch");
+    assert_eq!(
+        outcome.total_found as usize,
+        outcome.hits.len(),
+        "hit buffer overflowed"
+    );
+
+    let mut device: Vec<(u32, i64)> = outcome
+        .hits
+        .iter()
+        .map(|h| (h.thread_id, i64::from(h.offset)))
+        .collect();
+    device.sort_unstable();
+
+    let (first, count) = coverage(half, candidates);
+    assert_eq!(
+        outcome.examined,
+        u64::from(threads) * u64::from(count),
+        "examined count mismatch"
+    );
+
+    let mut host: Vec<(u32, i64)> = Vec::new();
+    for (t, s) in scalars.iter().enumerate() {
+        for (m, key) in host_offsets(s, first, count) {
+            if !set.matching_patterns(&key).is_empty() {
+                host.push((t as u32, m));
+            }
+        }
+    }
+    host.sort_unstable();
+
+    assert_eq!(
+        device, host,
+        "cooperative kernel disagrees with host for pattern {pattern_src:?} (half {half}); \
+         device found {} hits, host found {}",
+        device.len(),
+        host.len()
+    );
+    assert!(
+        !host.is_empty(),
+        "the test space contained no matches, so agreement is vacuous"
+    );
+}
+
+#[test]
+fn cooperative_walk_matches_scalar_arithmetic() {
+    if !have_gpu() {
+        return;
+    }
+    const WALKS: usize = 64;
+    const ITERS: u32 = 128;
+
+    let (scalars, points) = starting_points(WALKS, 31);
+
+    let ctx = CudaContext::new(0).expect("context");
+    let (major, minor) = ctx.compute_capability().expect("capability");
+    let cc = (major as u32, minor as u32);
+
+    let defines: Vec<(&str, String)> = vec![("FE_RADIX32", "1".into())];
+    let ptx = honion_gpu::nvrtc::compile_cached(
+        honion_gpu::nvrtc::sources::SEARCH_COOP,
+        cc,
+        &defines,
+    )
+    .expect("compiles");
+    let module = ctx.load_module(ptx.into()).expect("module");
+    let func = module
+        .load_function("honion_walk_dump_coop")
+        .expect("kernel");
+
+    let stream = ctx.default_stream();
+    let flat: Vec<u8> = points.iter().flatten().copied().collect();
+    let d_in: CudaSlice<u8> = stream.clone_htod(&flat).expect("upload");
+    let mut d_out: CudaSlice<u8> = stream
+        .alloc_zeros(WALKS * ITERS as usize * 32)
+        .expect("alloc");
+    let n = WALKS as u32;
+    let cuda_threads = n * 8;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&d_in).arg(&n).arg(&ITERS).arg(&mut d_out);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (cuda_threads.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .expect("launch");
+    stream.synchronize().expect("sync");
+    let out = stream.clone_dtoh(&d_out).expect("download");
+
+    for (t, s) in scalars.iter().enumerate() {
+        let expected = host_walk(s, ITERS);
+        for (k, want) in expected.iter().enumerate() {
+            let base = (t * ITERS as usize + k) * 32;
+            assert_eq!(
+                &out[base..base + 32],
+                &want[..],
+                "coop walk: thread {t} iteration {k} mismatch"
+            );
+        }
+    }
+}
+
+#[test]
+fn cooperative_finds_a_planted_needle() {
+    if !have_gpu() {
+        return;
+    }
+    const THREADS: u32 = 256;
+    const HALF: u32 = 64;
+    const CANDS: u32 = 4000;
+    const NEEDLE_THREAD: usize = 137;
+    const NEEDLE_OFFSET: i64 = -37;
+
+    let (scalars, points) = starting_points(THREADS as usize, 22);
+
+    let needle_scalar =
+        scalars[NEEDLE_THREAD] - Scalar::from(8u64) * Scalar::from(NEEDLE_OFFSET.unsigned_abs());
+    let needle_key = (ED25519_BASEPOINT_POINT * needle_scalar).compress().to_bytes();
+
+    let address = OnionAddress::from_pubkey(&needle_key);
+    let prefix: String = address.body().chars().take(10).collect();
+    let pattern = Pattern::parse(&prefix).expect("valid");
+    let set = PatternSet::compile(&[pattern]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+
+    let opts = coop_opts();
+    let mut searcher =
+        Searcher::with_options(&tables, THREADS, HALF, 1024, &opts).expect("searcher");
+    assert!(searcher.cooperative());
+    searcher.set_start_points(&points).expect("points");
+    let outcome = searcher.launch(CANDS).expect("launch");
+
+    assert_eq!(
+        outcome.total_found, 1,
+        "expected exactly the planted needle, got {} hits",
+        outcome.total_found
+    );
+    let hit = outcome.hits[0];
+    assert_eq!(hit.thread_id as usize, NEEDLE_THREAD, "wrong thread");
+    assert_eq!(i64::from(hit.offset), NEEDLE_OFFSET, "wrong offset");
+
+    let m = i64::from(hit.offset);
+    let recovered = if m >= 0 {
+        scalars[hit.thread_id as usize] + Scalar::from(8u64) * Scalar::from(m.unsigned_abs())
+    } else {
+        scalars[hit.thread_id as usize] - Scalar::from(8u64) * Scalar::from(m.unsigned_abs())
+    };
+    let recovered_key = (ED25519_BASEPOINT_POINT * recovered).compress().to_bytes();
+    assert_eq!(recovered_key, needle_key);
+    assert!(
+        OnionAddress::from_pubkey(&recovered_key)
+            .body()
+            .starts_with(&prefix),
+        "reconstructed key does not match"
+    );
+}
+
+#[test]
+fn cooperative_device_hits_match_host_reference() {
+    if !have_gpu() {
+        return;
+    }
+    assert_coop_agrees_with_host("ab", 256, 512, 32);
+    assert_coop_agrees_with_host("ab", 256, 500, 32);
+}
+
+#[test]
+fn cooperative_agreement_with_residuals() {
+    if !have_gpu() {
+        return;
+    }
+    assert_coop_agrees_with_host("[ab][cd]", 256, 512, 32);
+    assert_coop_agrees_with_host("a?c", 512, 512, 32);
+}
+
+#[test]
+fn cooperative_agreement_across_table_sizes() {
+    if !have_gpu() {
+        return;
+    }
+    for half in [1u32, 2, 8, 16, 64, 128] {
+        assert_coop_agrees_with_host("ab", 64, 3000, half);
     }
 }
