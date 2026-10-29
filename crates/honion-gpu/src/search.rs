@@ -73,11 +73,15 @@ pub const fn local_bytes_per_thread(half: u32) -> u64 {
 /// number rises. The cap below is set from end-to-end measurement, not from
 /// how much memory happens to be free.
 ///
+/// The count is a property of one device; with several devices in play it is
+/// computed per device, not globally.
+///
 /// # Errors
 ///
 /// If the device cannot be queried.
-pub fn auto_threads(half: u32) -> Result<u32, SearchError> {
-    let ctx = CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+pub fn auto_threads(device: u32, half: u32) -> Result<u32, SearchError> {
+    let ctx =
+        CudaContext::new(device as usize).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
     let (free, _total) = ctx
         .mem_get_info()
         .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -89,6 +93,17 @@ pub fn auto_threads(half: u32) -> Result<u32, SearchError> {
     // without adding kernel throughput.
     let blocks = (fit / u64::from(BLOCK_SIZE)).clamp(64, 2048);
     Ok((blocks as u32) * BLOCK_SIZE)
+}
+
+/// The number of CUDA devices the driver can see.
+///
+/// # Errors
+///
+/// If the CUDA driver cannot be initialised.
+pub fn device_count() -> Result<u32, SearchError> {
+    CudaContext::device_count()
+        .map(|n| u32::try_from(n).unwrap_or(0))
+        .map_err(|e| SearchError::Driver(format!("{e:?}")))
 }
 
 /// A candidate the device believes matches.
@@ -133,8 +148,15 @@ pub struct LaunchOutcome {
     pub examined: u64,
 }
 
-/// A configured search: compiled kernel, uploaded tables, allocated buffers.
+/// A configured search on one device: compiled kernel, uploaded tables,
+/// allocated buffers.
+///
+/// Several `Searcher`s can be alive at once — on different devices, or even
+/// two on one device — and share nothing but the host-side tables they were
+/// built from. Each holds its own context, its own buffers, and its own hit
+/// list, so they can be driven from separate threads independently.
 pub struct Searcher {
+    device: u32,
     ctx: Arc<CudaContext>,
     func: CudaFunction,
     half: u32,
@@ -162,7 +184,7 @@ pub struct Searcher {
 }
 
 impl Searcher {
-    /// Compile the kernel for the present device and upload `tables`.
+    /// Compile the kernel for device `device` and upload `tables`.
     ///
     /// `num_threads` is how many independent walks run concurrently; it should
     /// be a large multiple of [`BLOCK_SIZE`]. `max_hits` bounds the per-launch
@@ -170,9 +192,11 @@ impl Searcher {
     ///
     /// # Errors
     ///
-    /// If no CUDA device is present, the kernel fails to compile, or a device
-    /// allocation fails.
+    /// [`SearchError::BadParameter`] if `device` names a device the driver
+    /// cannot see; [`SearchError::Driver`] if the kernel fails to compile or a
+    /// device allocation fails.
     pub fn new(
+        device: u32,
         tables: &DeviceTables,
         num_threads: u32,
         half: u32,
@@ -183,7 +207,18 @@ impl Searcher {
                 "half must be positive; it is the number of precomputed offsets".into(),
             ));
         }
-        let ctx = CudaContext::new(0).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
+        // Checked here rather than surfaced from the driver, so an ordinary
+        // `--device 3` on a two-card box says that in words instead of in the
+        // dialect of `cuDeviceGet`.
+        let count = device_count()?;
+        if device >= count {
+            return Err(SearchError::BadParameter(format!(
+                "no device {device}; the driver sees {count} (0..{})",
+                count.saturating_sub(1),
+            )));
+        }
+        let ctx =
+            CudaContext::new(device as usize).map_err(|e| SearchError::Driver(format!("{e:?}")))?;
         let (major, minor) = ctx
             .compute_capability()
             .map_err(|e| SearchError::Driver(format!("{e:?}")))?;
@@ -279,6 +314,7 @@ impl Searcher {
         }
 
         Ok(Self {
+            device,
             ctx,
             func,
             half,
@@ -298,6 +334,23 @@ impl Searcher {
             d_status,
             max_hits,
         })
+    }
+
+    /// The device ordinal this searcher runs on.
+    #[must_use]
+    pub const fn device(&self) -> u32 {
+        self.device
+    }
+
+    /// The device's marketing name, as the driver reports it.
+    ///
+    /// # Errors
+    ///
+    /// If the device cannot be queried.
+    pub fn name(&self) -> Result<String, SearchError> {
+        self.ctx
+            .name()
+            .map_err(|e| SearchError::Driver(format!("{e:?}")))
     }
 
     /// Number of concurrent walks.

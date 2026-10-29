@@ -14,9 +14,9 @@ and the five attempts that did not.
 
 ```
 $ honion search --prefix carroll --out ./keys --count 1
-honion: searching for 1 pattern(s)
+honion: searching for 1 pattern(s) on 1 device(s)
   carroll (35.0 bits, from --prefix)
-  device compute capability 12.0, 262144 threads, 256 offsets (513 candidates per inversion, 8.6 GB device memory)
+  device 0 (NVIDIA RTX PRO 6000 Blackwell) compute capability 12.0, 262144 threads, 256 offsets (513 candidates per inversion, 8.6 GB device memory)
      45.26G examined    11.31G/s  elapsed  4.0s  expected  3.0s  P(found) 74.4%  hits 0
      …
 carrolliuz67cgsdlpeu5e2hcrcg3rzaowhrj2dps4pwwgrkxd7xrtqd.onion
@@ -46,6 +46,7 @@ cargo build --release
 ```
 honion estimate --prefix carroll            # how long will this take?
 honion search   --prefix carroll --out ./keys --count 1
+honion search   --device all --prefix carroll --out ./keys   # every GPU
 honion verify   ./keys/carroll…             # re-derive and check a result
 ```
 
@@ -53,6 +54,14 @@ Patterns are base32 characters (`a`–`z`, `2`–`7`), `?` for any character, an
 `[abc]` / `[^abc]` for a choice. Repeat `--prefix`, or pass
 `--patterns-file` — searching many patterns at once costs almost nothing and is
 the cheapest way to improve your odds.
+
+`--device` takes `all` or a comma-separated list of device numbers
+(`--device 0,2`). Each device searches independently with its own fresh
+scalars, so the rates add and one progress line reports the machine's
+combined throughput; `--count` is what all the devices write together.
+`--threads` and the device-memory sizing are per device. Host-side scalar
+preparation also runs per device, so a fully populated box wants CPU cores
+to match.
 
 Note there is no `0`, `1`, `8` or `9` in base32. Use `o`, `l`, `s`, `z`.
 

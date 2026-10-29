@@ -34,6 +34,8 @@ Examples:
   honion estimate --prefix carroll          how long would this take?
   honion search --prefix carroll --out ./keys
   honion search --prefix hon2on --prefix hon2en --out ./keys --count 5
+  honion search --device all --prefix carroll --out ./keys    every GPU
+  honion search --device 0,2 --prefix carroll --out ./keys    two of several
   honion verify ./keys/carroll....onion     re-derive and check a result
 
 Patterns are base32: a-z and 2-7 only. There is no 0, 1, 8 or 9 -- use o, l,

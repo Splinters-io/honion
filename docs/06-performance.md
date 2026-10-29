@@ -41,7 +41,7 @@ watch the rate line during a real search:
 ```
 $ honion search --prefix carroll --out ./keys --count 1
   combined difficulty 35.0 bits, prefilter 35.0 bits
-  device compute capability 12.0, 131072 threads, 256 offsets (513 candidates per inversion)
+  device 0 (NVIDIA RTX PRO 6000 Blackwell) compute capability 12.0, 131072 threads, 256 offsets (513 candidates per inversion)
      32.47G examined     7.56G/s  elapsed       4.3s  expected       4.5s  P(found)  61.1%  hits 0
      …
 carrolliuz67cgsdlpeu5e2hcrcg3rzaowhrj2dps4pwwgrkxd7xrtqd.onion

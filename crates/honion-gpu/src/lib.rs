@@ -19,6 +19,6 @@ pub mod tables;
 
 pub use search::{
     DEFAULT_HALF, Hit, LaunchOutcome, SearchError, Searcher, auto_threads, candidates_per_batch,
-    local_bytes_per_thread,
+    device_count, local_bytes_per_thread,
 };
 pub use tables::{DeviceTables, TableError};

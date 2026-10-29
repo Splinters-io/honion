@@ -20,7 +20,7 @@ use curve25519_dalek::scalar::Scalar;
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use honion_core::address::OnionAddress;
 use honion_core::pattern::{Pattern, PatternSet};
-use honion_gpu::{DeviceTables, Searcher};
+use honion_gpu::{DeviceTables, SearchError, Searcher};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -179,7 +179,7 @@ fn finds_a_planted_needle() {
     let set = PatternSet::compile(&[pattern]).expect("non-empty");
     let tables = DeviceTables::build(&set);
 
-    let mut searcher = Searcher::new(&tables, THREADS, HALF, 1024).expect("searcher");
+    let mut searcher = Searcher::new(0, &tables, THREADS, HALF, 1024).expect("searcher");
     searcher.set_start_points(&points).expect("points");
     let outcome = searcher.launch(CANDS).expect("launch");
 
@@ -216,7 +216,7 @@ fn assert_device_agrees_with_host(pattern_src: &str, threads: u32, candidates: u
     let set = PatternSet::compile(&[pattern]).expect("non-empty");
     let tables = DeviceTables::build(&set);
 
-    let mut searcher = Searcher::new(&tables, threads, half, 1 << 16).expect("searcher");
+    let mut searcher = Searcher::new(0, &tables, threads, half, 1 << 16).expect("searcher");
     searcher.set_start_points(&points).expect("points");
     let outcome = searcher.launch(candidates).expect("launch");
     assert_eq!(
@@ -321,7 +321,7 @@ fn multiple_patterns_are_all_reported() {
     let half = 32u32;
     let candidates = 512u32;
     let (scalars, points) = starting_points(threads as usize, 24);
-    let mut searcher = Searcher::new(&tables, threads, half, 1 << 16).expect("searcher");
+    let mut searcher = Searcher::new(0, &tables, threads, half, 1 << 16).expect("searcher");
     searcher.set_start_points(&points).expect("points");
     let outcome = searcher.launch(candidates).expect("launch");
 
@@ -352,4 +352,157 @@ fn multiple_patterns_are_all_reported() {
             sources[pid as usize]
         );
     }
+}
+
+/// How many devices the driver sees, for tests that need two.
+fn device_count() -> u32 {
+    honion_gpu::device_count().unwrap_or(0)
+}
+
+/// Geometry of a needle planted at a fixed coordinate of a seeded search
+/// space, shared by the tests that run one device and the tests that run
+/// two, so every variant exercises exactly the same shape of search.
+const NEEDLE_THREADS: u32 = 256;
+const NEEDLE_HALF: u32 = 64;
+const NEEDLE_CANDS: u32 = 4000;
+const NEEDLE_THREAD: usize = 91;
+const NEEDLE_OFFSET: i64 = 13;
+
+/// Pattern tables and starting points for a needle inside the seed's space.
+///
+/// Distinct seeds give disjoint search spaces, so two runs can never find
+/// each other's needles — which is the point of running them side by side.
+fn needle_setup(seed: u64) -> (DeviceTables, Vec<[u8; 32]>) {
+    let (scalars, points) = starting_points(NEEDLE_THREADS as usize, seed);
+    let needle_scalar =
+        scalars[NEEDLE_THREAD] + Scalar::from(8u64) * Scalar::from(NEEDLE_OFFSET as u64);
+    let needle_key = (ED25519_BASEPOINT_POINT * needle_scalar)
+        .compress()
+        .to_bytes();
+    let prefix: String = OnionAddress::from_pubkey(&needle_key)
+        .body()
+        .chars()
+        .take(10)
+        .collect();
+    let set = PatternSet::compile(&[Pattern::parse(&prefix).expect("valid")]).expect("non-empty");
+    (DeviceTables::build(&set), points)
+}
+
+/// `finds_a_planted_needle` in parameterised form: plant a key in `device`'s
+/// search space and require it back at exactly the right coordinate.
+fn assert_device_finds_its_needle(device: u32, seed: u64) {
+    let (tables, points) = needle_setup(seed);
+    let mut searcher =
+        Searcher::new(device, &tables, NEEDLE_THREADS, NEEDLE_HALF, 1024).expect("searcher");
+    searcher.set_start_points(&points).expect("points");
+    let outcome = searcher.launch(NEEDLE_CANDS).expect("launch");
+
+    assert_eq!(
+        outcome.total_found, 1,
+        "device {device}: expected exactly the planted needle, got {} hits",
+        outcome.total_found,
+    );
+    let hit = outcome.hits[0];
+    assert_eq!(
+        hit.thread_id as usize, NEEDLE_THREAD,
+        "device {device}: wrong thread reported"
+    );
+    assert_eq!(
+        i64::from(hit.offset),
+        NEEDLE_OFFSET,
+        "device {device}: wrong offset reported"
+    );
+}
+
+#[test]
+fn a_device_the_driver_cannot_see_is_refused_by_name() {
+    if !have_gpu() {
+        return;
+    }
+    let pattern = Pattern::parse("ab").expect("valid");
+    let set = PatternSet::compile(&[pattern]).expect("non-empty");
+    let tables = DeviceTables::build(&set);
+
+    let err = match Searcher::new(device_count(), &tables, 256, 32, 16) {
+        Err(e) => e,
+        Ok(_) => panic!("a device the driver cannot see was accepted"),
+    };
+    // The point of the check is the message: an out-of-range ordinal must
+    // read as "that device does not exist", not as a driver-internal code.
+    match err {
+        SearchError::BadParameter(msg) => {
+            assert!(msg.contains("no device"), "unhelpful: {msg}");
+        }
+        other => panic!("expected BadParameter, got {other:?}"),
+    }
+}
+
+#[test]
+fn two_searchers_coexist_on_one_device() {
+    // The `--device 0,0` path: two Searchers, two contexts on the same card,
+    // interleaved launches. Each must find its own needle and nothing of the
+    // other's. If allocation or context handling ever grows cross-talk, this
+    // fails even on a single-GPU machine.
+    if !have_gpu() {
+        return;
+    }
+    let (tables_a, points_a) = needle_setup(31);
+    let (tables_b, points_b) = needle_setup(32);
+    let mut first =
+        Searcher::new(0, &tables_a, NEEDLE_THREADS, NEEDLE_HALF, 1024).expect("first searcher");
+    let mut second =
+        Searcher::new(0, &tables_b, NEEDLE_THREADS, NEEDLE_HALF, 1024).expect("second searcher");
+    first.set_start_points(&points_a).expect("points a");
+    second.set_start_points(&points_b).expect("points b");
+
+    // Interleaved launches: work from one is in flight or freshly resident
+    // while the other runs. Launches are stateless — the same starting
+    // points re-cover the same range — so every launch of each Searcher
+    // must report its own needle identically. That determinism is what the
+    // host reconstruction relies on.
+    let out_a = first.launch(NEEDLE_CANDS).expect("launch a");
+    let out_b = second.launch(NEEDLE_CANDS).expect("launch b");
+    let out_a2 = first.launch(NEEDLE_CANDS).expect("launch a2");
+    let out_b2 = second.launch(NEEDLE_CANDS).expect("launch b2");
+
+    for (found, seed) in [(&out_a, 31u64), (&out_a2, 31), (&out_b, 32), (&out_b2, 32)] {
+        assert_eq!(
+            found.total_found, 1,
+            "seed {seed}: expected exactly the needle"
+        );
+        assert_eq!(
+            found.hits[0].thread_id as usize,
+            NEEDLE_THREAD,
+            "seed {seed}"
+        );
+        assert_eq!(
+            i64::from(found.hits[0].offset),
+            NEEDLE_OFFSET,
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn separate_devices_search_concurrently() {
+    // The real multi-GPU path: one worker thread per device, each with its
+    // own Searcher and its own epoch, running at the same time. Each device
+    // must find its own planted needle and only that one.
+    let count = device_count();
+    if count < 2 {
+        eprintln!("skipping: needs two CUDA devices, this machine has {count}");
+        return;
+    }
+    std::thread::scope(|scope| {
+        for device in 0..2 {
+            std::thread::Builder::new()
+                .name(format!("needle-gpu{device}"))
+                // NVRTC compiles on this thread; the 2 MiB default overflows.
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    assert_device_finds_its_needle(device, u64::from(40 + device))
+                })
+                .expect("spawning a worker");
+        }
+    });
 }

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 fn main() {
     let half: u32 = std::env::var("HALF").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let device: u32 = std::env::var("DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let threads: u32 = std::env::var("THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 18);
     let iters: u32 = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
 
@@ -24,7 +25,7 @@ fn main() {
     let tables = DeviceTables::build(&set);
 
     let t1 = Instant::now();
-    let mut s = Searcher::new(&tables, threads, half, 4096).expect("searcher");
+    let mut s = Searcher::new(device, &tables, threads, half, 4096).expect("searcher");
     println!("compile + JIT + up : {:>8.2?}", t1.elapsed());
 
     let points: Vec<[u8; 32]> = (0..threads)
